@@ -191,7 +191,9 @@ static void XvtMovieTask_Submit(void) {
 	if (!Aeron_VideoGetInfo(g_movie.player, &info) || info.width <= 0 || info.height <= 0)
 		return;
 	width = info.width;
-	height = info.height;
+	/* Y-interlaced Smacker files decode at half height with a 1:2 sample aspect ratio. */
+	height = info.display_width > 0 ? (int)((int64_t)info.width * info.display_height / info.display_width)
+									: info.height;
 	/* Original Smacker playback centers the native frame in the 640x480 display. */
 	if (width > 640 || height > 480) {
 		g_movie.result = 3;
