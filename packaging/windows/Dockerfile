@@ -306,6 +306,20 @@ RUN cmake --install /build/xvt --component Runtime --prefix /build/package/openx
             /build/package/openxvt-windows-x86_64/licenses/WinPixEventRuntime.txt \
         && cp /opt/xvt-licenses/WinPixEventRuntime-ThirdPartyNotices.txt \
             /build/package/openxvt-windows-x86_64/licenses/WinPixEventRuntime-ThirdPartyNotices.txt; \
+    fi \
+    # Bundled DLLs, notably Debian's libstdc++, carry DWARF; split it the same way.
+    && if [ "${XVT_BUILD_TYPE}" = Release ]; then \
+        cd /build/package/openxvt-windows-x86_64 \
+        && for library in *.dll; do \
+            if x86_64-w64-mingw32-objdump -h "$library" | grep -q '\.debug_'; then \
+                x86_64-w64-mingw32-objcopy --only-keep-debug "$library" "/build/symbols/${library}.debug" \
+                && cp "/build/symbols/${library}.debug" . \
+                && x86_64-w64-mingw32-objcopy --strip-debug --add-gnu-debuglink="${library}.debug" "$library" \
+                && rm "${library}.debug" \
+                && cp "$library" /build/symbols/ \
+                || exit 1; \
+            fi; \
+        done; \
     fi
 
 RUN test -f /build/package/openxvt-windows-x86_64/shaders/aeron_dx5_projected_triangle.vert.dxil \
@@ -341,7 +355,10 @@ RUN test -f /build/package/openxvt-windows-x86_64/shaders/aeron_dx5_projected_tr
             /build/package/openxvt-windows-x86_64/OpenXvT.exe \
             | grep -q '\.gnu_debuglink' \
         && x86_64-w64-mingw32-objdump -h /build/symbols/OpenXvT.exe.debug \
-            | grep -q '\.debug_info'; \
+            | grep -q '\.debug_info' \
+        && for library in /build/package/openxvt-windows-x86_64/*.dll; do \
+            ! x86_64-w64-mingw32-objdump -h "$library" | grep -q '\.debug_' || exit 1; \
+        done; \
     fi \
     && if [ "${XVT_BUILD_TYPE}" = Debug ]; then \
         artifact_variant=debug; \
@@ -364,8 +381,8 @@ RUN test -f /build/package/openxvt-windows-x86_64/shaders/aeron_dx5_projected_tr
         && mv /build/symbols "/build/${symbols_name}" \
         && find "/build/${symbols_name}" -exec touch -h -d "@315532800" {} + \
         && cd /build \
-        && TZ=UTC zip -X -9 -q "/build/artifacts/${symbols_name}.zip" \
-            "${symbols_name}" "${symbols_name}/OpenXvT.exe" "${symbols_name}/OpenXvT.exe.debug" \
+        && find "${symbols_name}" -print | LC_ALL=C sort \
+            | TZ=UTC zip -X -9 -q "/build/artifacts/${symbols_name}.zip" -@ \
         && unzip -tq "/build/artifacts/${symbols_name}.zip"; \
     fi
 
