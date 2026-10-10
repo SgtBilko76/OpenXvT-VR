@@ -247,13 +247,15 @@ COPY src /src/src
 ENV LD_LIBRARY_PATH=/opt/xvt-host/lib
 
 RUN case "${XVT_BUILD_TYPE}" in \
-        Release) xvt_debug_ui=OFF ;; \
-        Debug) xvt_debug_ui=ON ;; \
+        Release) xvt_debug_ui=OFF; xvt_release_flags="-O3 -DNDEBUG -g" ;; \
+        Debug) xvt_debug_ui=ON; xvt_release_flags="-O3 -DNDEBUG" ;; \
         *) echo "XVT_BUILD_TYPE must be Release or Debug" >&2; exit 2 ;; \
     esac \
     && cmake -S /src -B /build/xvt -G Ninja \
         -DCMAKE_BUILD_TYPE="${XVT_BUILD_TYPE}" \
         -DCMAKE_TOOLCHAIN_FILE=/opt/xvt-toolchain.cmake \
+        -DCMAKE_C_FLAGS_RELEASE="${xvt_release_flags}" \
+        -DCMAKE_CXX_FLAGS_RELEASE="${xvt_release_flags}" \
         -DAERON_FSR3_SHADERGEN_EXECUTABLE=/opt/xvt-host/bin/aeron_fsr3_shadergen \
         -DAERON_SHADERCROSS_EXECUTABLE=/opt/xvt-host/bin/shadercross \
         -DXVT_BUILD_TOOLS=OFF \
@@ -263,7 +265,20 @@ RUN case "${XVT_BUILD_TYPE}" in \
         -DXVT_VERSION="${XVT_VERSION}" \
     && cmake --build /build/xvt --target xvt --parallel
 
+# Release builds compile with -g so crash dumps can be symbolized; the DWARF
+# is split into OpenXvT.exe.debug, published as a separate symbols archive,
+# and the shipped exe keeps only a .gnu_debuglink to it. Stripping removes
+# trailing sections only, so code addresses match the symbols exactly.
 RUN cmake --install /build/xvt --component Runtime --prefix /build/package/openxvt-windows-x86_64 \
+    && if [ "${XVT_BUILD_TYPE}" = Release ]; then \
+        mkdir -p /build/symbols \
+        && cd /build/package/openxvt-windows-x86_64 \
+        && x86_64-w64-mingw32-objcopy --only-keep-debug OpenXvT.exe /build/symbols/OpenXvT.exe.debug \
+        && cp /build/symbols/OpenXvT.exe.debug . \
+        && x86_64-w64-mingw32-objcopy --strip-debug --add-gnu-debuglink=OpenXvT.exe.debug OpenXvT.exe \
+        && rm OpenXvT.exe.debug \
+        && cp OpenXvT.exe /build/symbols/OpenXvT.exe; \
+    fi \
     && mkdir -p /build/package/openxvt-windows-x86_64/licenses \
     && cp /opt/xvt-licenses/SDL3.txt \
         /build/package/openxvt-windows-x86_64/licenses/SDL3.txt \
@@ -318,6 +333,15 @@ RUN test -f /build/package/openxvt-windows-x86_64/shaders/aeron_dx5_projected_tr
             /build/package/openxvt-windows-x86_64/OpenXvT.exe \
             | grep -q '\.debug_info' \
         && test -f /build/package/openxvt-windows-x86_64/WinPixEventRuntime.dll; \
+    else \
+        ! x86_64-w64-mingw32-objdump -h \
+            /build/package/openxvt-windows-x86_64/OpenXvT.exe \
+            | grep -q '\.debug_info' \
+        && x86_64-w64-mingw32-objdump -h \
+            /build/package/openxvt-windows-x86_64/OpenXvT.exe \
+            | grep -q '\.gnu_debuglink' \
+        && x86_64-w64-mingw32-objdump -h /build/symbols/OpenXvT.exe.debug \
+            | grep -q '\.debug_info'; \
     fi \
     && if [ "${XVT_BUILD_TYPE}" = Debug ]; then \
         artifact_variant=debug; \
@@ -334,7 +358,16 @@ RUN test -f /build/package/openxvt-windows-x86_64/shaders/aeron_dx5_projected_tr
     && LC_ALL=C sort -o /tmp/openxvt-windows-files /tmp/openxvt-windows-files \
     && TZ=UTC zip -X -9 -q "/build/artifacts/${package_name}.zip" \
         -@ < /tmp/openxvt-windows-files \
-    && unzip -tq "/build/artifacts/${package_name}.zip"
+    && unzip -tq "/build/artifacts/${package_name}.zip" \
+    && if [ "${XVT_BUILD_TYPE}" = Release ]; then \
+        symbols_name="${package_name}-symbols" \
+        && mv /build/symbols "/build/${symbols_name}" \
+        && find "/build/${symbols_name}" -exec touch -h -d "@315532800" {} + \
+        && cd /build \
+        && TZ=UTC zip -X -9 -q "/build/artifacts/${symbols_name}.zip" \
+            "${symbols_name}" "${symbols_name}/OpenXvT.exe" "${symbols_name}/OpenXvT.exe.debug" \
+        && unzip -tq "/build/artifacts/${symbols_name}.zip"; \
+    fi
 
 FROM build-base AS netprobe-build
 

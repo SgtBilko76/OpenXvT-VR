@@ -194,13 +194,16 @@ ENV LD_LIBRARY_PATH=/opt/xvt-tools/lib:/opt/xvt-linux/lib
 ENV PKG_CONFIG_PATH=/opt/xvt-linux/lib/pkgconfig
 
 RUN case "${XVT_BUILD_TYPE}" in \
-        Release) xvt_debug_ui=OFF ;; \
-        Debug) xvt_debug_ui=ON ;; \
+        Release) xvt_debug_ui=OFF; xvt_release_flags="-O3 -DNDEBUG -g" ;; \
+        Debug) xvt_debug_ui=ON; xvt_release_flags="-O3 -DNDEBUG" ;; \
         *) echo "XVT_BUILD_TYPE must be Release or Debug" >&2; exit 2 ;; \
     esac \
     && cmake -S /src -B /build/xvt -G Ninja \
         -DCMAKE_BUILD_TYPE="${XVT_BUILD_TYPE}" \
         -DCMAKE_PREFIX_PATH=/opt/xvt-linux \
+        -DCMAKE_C_FLAGS_RELEASE="${xvt_release_flags}" \
+        -DCMAKE_CXX_FLAGS_RELEASE="${xvt_release_flags}" \
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,--build-id" \
         -DAERON_SHADERCROSS_EXECUTABLE=/opt/xvt-tools/bin/shadercross \
         -DXVT_BUILD_TOOLS=OFF \
         -DXVT_ENABLE_ASAN=OFF \
@@ -235,7 +238,17 @@ RUN cmake --install /build/xvt --component Runtime --prefix /build/package/openx
         /build/package/openxvt-linux-x86_64/OpenXvT \
     && for library in /build/package/openxvt-linux-x86_64/lib/*.so*; do \
         patchelf --set-rpath '$ORIGIN' "$library"; \
-    done
+    done \
+    # Release symbols ship separately, matched to the binary by its build ID.
+    && if [ "${XVT_BUILD_TYPE}" = Release ]; then \
+        mkdir -p /build/symbols \
+        && cd /build/package/openxvt-linux-x86_64 \
+        && objcopy --only-keep-debug OpenXvT /build/symbols/OpenXvT.debug \
+        && cp /build/symbols/OpenXvT.debug . \
+        && objcopy --strip-debug --add-gnu-debuglink=OpenXvT.debug OpenXvT \
+        && rm OpenXvT.debug \
+        && cp OpenXvT /build/symbols/OpenXvT; \
+    fi
 
 RUN test -f /build/package/openxvt-linux-x86_64/shaders/aeron_dx5_projected_triangle.vert.spv \
     && test -f /build/package/openxvt-linux-x86_64/shaders/hyperspace_streak.vert.spv \
@@ -277,9 +290,14 @@ RUN test -f /build/package/openxvt-linux-x86_64/shaders/aeron_dx5_projected_tria
             fi; \
         done; \
     done \
+    && readelf -n /build/package/openxvt-linux-x86_64/OpenXvT | grep -q 'Build ID' \
     && if [ "${XVT_BUILD_TYPE}" = Debug ]; then \
         readelf --sections /build/package/openxvt-linux-x86_64/OpenXvT \
             | grep -q '\.debug_info'; \
+    else \
+        ! readelf --sections /build/package/openxvt-linux-x86_64/OpenXvT \
+            | grep -q '\.debug_info' \
+        && readelf --sections /build/symbols/OpenXvT.debug | grep -q '\.debug_info'; \
     fi \
     && if [ "${XVT_BUILD_TYPE}" = Debug ]; then \
         artifact_variant=debug; \
@@ -298,7 +316,20 @@ RUN test -f /build/package/openxvt-linux-x86_64/shaders/aeron_dx5_projected_tria
         -C /build/package \
         -cJf "/build/artifacts/${package_name}.tar.xz" \
         "${package_name}" \
-    && tar -tJf "/build/artifacts/${package_name}.tar.xz"
+    && tar -tJf "/build/artifacts/${package_name}.tar.xz" \
+    && if [ "${XVT_BUILD_TYPE}" = Release ]; then \
+        mv /build/symbols "/build/${package_name}-symbols" \
+        && tar \
+            --sort=name \
+            --mtime="@0" \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C /build \
+            -cJf "/build/artifacts/${package_name}-symbols.tar.xz" \
+            "${package_name}-symbols" \
+        && tar -tJf "/build/artifacts/${package_name}-symbols.tar.xz"; \
+    fi
 
 FROM network-build-base AS netprobe-build
 

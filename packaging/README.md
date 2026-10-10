@@ -83,8 +83,24 @@ Use `--build-arg XVT_BUILD_TYPE=Debug` to build Debug packages.
 - Linux: libraries in `lib/`, executable RPATH `$ORIGIN/lib`, library RPATH `$ORIGIN`.
 - Linux host requirements: glibc 2.35+, GCC 12-compatible runtimes, libcurl and graphics/audio drivers.
 - Windows: runtime DLLs beside the executable; Debug includes WinPixEventRuntime.
+- Release: Windows and Linux debug symbols ship separately in `…-release-symbols` archives.
 - A plain non-macOS `cmake --install --component Runtime` stages application files;
   Docker packaging adds runtime dependencies and their licenses.
+
+## Crash reports
+
+Logs, crash stacks and Windows crash dumps are written to the `diagnostics` folder in the
+user directory (`%APPDATA%\TotallyOpen\OpenXvT` on Windows,
+`~/.local/share/TotallyOpen/OpenXvT` on Linux).
+`AERON_TEST_CRASH=access|abort|stack` forces a crash at startup.
+
+Resolve frames from the log with the matching symbols archive. On Windows, add the
+`OpenXvT.exe+<offset>` offset to `0x140000000`; on Linux, use the `OpenXvT(+<offset>)`
+offset as is:
+
+```sh
+llvm-symbolizer --obj=OpenXvT.exe 0x1402d9dbb
+```
 
 ## Headless multiplayer probe
 

@@ -72,6 +72,7 @@ void XvtHostConfig_InitAeron(const XvtLaunchOptions* options, AeronConfig* confi
 	memset(config, 0, sizeof(*config));
 	config->org_name = "TotallyOpen";
 	config->app_name = "OpenXvT";
+	config->app_version = OPENXVT_VERSION;
 	config->window_title = "OpenXvT";
 	config->window_icon_bmp = xvt_window_icon_bmp;
 	config->window_icon_bmp_size = sizeof xvt_window_icon_bmp;
