@@ -71,7 +71,7 @@ static const char* VrCockpit_Root(void) {
 		return g_cp.root[0] ? g_cp.root : NULL;
 	g_cp.root_checked = 1;
 	const char* candidates[] = { SDL_getenv("OPENXVT_REVIVAL_DIR"), "/sdcard/OpenXvT/XWingRevival",
-								 "/sdcard/XWingRevival", "XWingRevival" };
+								 "XWingRevival" };
 	for (size_t i = 0; i < sizeof candidates / sizeof candidates[0]; ++i) {
 		if (candidates[i] && candidates[i][0] && VrCockpit_DirHasModels(candidates[i])) {
 			SDL_strlcpy(g_cp.root, candidates[i], sizeof g_cp.root);
@@ -198,6 +198,32 @@ void XvtVrCockpit_Submit(AeronScene3D* scene, const XvtRenderSnapshot* s, const 
 	instance.transform[11] = camera_pos[2];
 	memcpy(instance.prev_transform, instance.transform, sizeof instance.transform);
 	AeronScene_AddMeshInstance(scene, &instance);
+}
+
+void XvtVrCockpit_SelfTest(void) {
+	/* Bring-up aid: with <data>/cockpit_selftest.txt present, convert every
+	 * cockpit once at start-up (CPU only) and log the result. */
+	SDL_IOStream* marker = SDL_IOFromFile("/sdcard/OpenXvT/cockpit_selftest.txt", "rb");
+	if (!marker)
+		return;
+	SDL_CloseIO(marker);
+	const char* root = VrCockpit_Root();
+	for (size_t i = 0; root && i < sizeof k_cockpits / sizeof k_cockpits[0]; ++i) {
+		char path[700], textures[600], error[256];
+		snprintf(path, sizeof path, "%s/Models/%s", root, k_cockpits[i].file);
+		snprintf(textures, sizeof textures, "%s/Textures", root);
+		AeronObjModelBuildOptions options = { .scale = 0.022f, .texture_dir = textures };
+		AeronFlightModel model;
+		const uint64_t start = SDL_GetTicksNS();
+		if (Aeron_ObjModelBuildFile(path, &options, &model, error, sizeof error)) {
+			Aeron_LogInfo(VR_COCKPIT_LOG, "self-test %s: ok, %u vertices, %u materials, %.0f ms", k_cockpits[i].file,
+						  model.render.vertex_count, model.render.material_count,
+						  (double)(SDL_GetTicksNS() - start) / 1e6);
+			Aeron_FlightModelFree(&model);
+		} else {
+			Aeron_LogWarn(VR_COCKPIT_LOG, "self-test %s: %s", k_cockpits[i].file, error);
+		}
+	}
 }
 
 int XvtVrCockpit_Active(void) { return g_cp.active && g_cp.mesh; }

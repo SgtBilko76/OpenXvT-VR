@@ -4,8 +4,8 @@
 /* 3D cockpits for VR flight from X-Wing Revival (the cockpit OBJ files in
  * Models/ plus Textures/; upgraded X-Wing Alliance cockpits from the XWA
  * Upgrade project), loaded and converted at runtime.
- * Searched in $OPENXVT_REVIVAL_DIR, /sdcard/OpenXvT/XWingRevival,
- * /sdcard/XWingRevival, then the copy bundled in the APK. While one is
+ * Searched in $OPENXVT_REVIVAL_DIR, /sdcard/OpenXvT/XWingRevival, then
+ * the copy bundled in the APK. While one is
  * drawn the original cockpit artwork is hidden (hud_draw.c) and only the
  * instruments remain. */
 
@@ -23,6 +23,7 @@ int  XvtVrCockpit_Prepare(AeronCommandBuffer* cmd, const XvtRenderSnapshot* snap
 void XvtVrCockpit_Submit(AeronScene3D* scene, const XvtRenderSnapshot* snapshot, const XvtPreparedFlight* frame,
 						 const float camera_pos[3]);
 int  XvtVrCockpit_Active(void);
+void XvtVrCockpit_SelfTest(void);
 void XvtVrCockpit_Shutdown(void);
 
 #ifdef __cplusplus

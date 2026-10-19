@@ -40,6 +40,7 @@ int XvtRemaster_Init(void) {
 	g_lastScene = XVT_SCENE_NONE;
 	g_frontendSurfacesReleased = 0;
 	XvtRemasterView_Init();
+	XvtVrCockpit_SelfTest();
 	g_initialized = 1;
 	Aeron_LogInfo("xvt.remaster", "driver initialized; modern presentation requested");
 	return 1;
