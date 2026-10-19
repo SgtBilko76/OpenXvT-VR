@@ -25,6 +25,7 @@ struct BitmapFont {
 typedef uint16_t GlyphScratchBuffer[65536];
 
 extern int g_activeTextFieldId;
+extern unsigned int g_textFieldEditSerial;
 
 int FrontendText_DrawEditableField(RECT* rect, char* text, int maxChars, int fieldId, unsigned int fontSize,
 								   const char* ignoredChars);

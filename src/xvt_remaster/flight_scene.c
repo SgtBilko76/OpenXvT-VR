@@ -10,12 +10,19 @@
 #include "xvt_remaster/lighting.h"
 #include "xvt_remaster/ship.h"
 #include "xvt_remaster/sky.h"
+#include "xvt_remaster/vr_cockpit.h"
+#include "xvt_remaster/vr_stereo.h"
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
 static AeronScene3D* g_scene;
 static AeronSceneMeshTable* g_tables;
 static int g_width, g_height, g_samples, g_outputValid;
+/* VR stereo: the eye being rendered (NULL on the flat path) and its copy of
+ * the prepared frame with the eye camera. */
+static const XvtVrStereoEye* g_eye;
+static XvtPreparedFlight g_eyeFrame;
 
 static int Ensure(int width, int height) {
 	int samples = XvtRemasterConfig_Effective()->msaa_samples;
@@ -73,6 +80,82 @@ static void DrawHudAfterUpscale(AeronCommandBuffer* cmd, AeronRenderPass* pass, 
 	XvtHudRenderer_Draw(cmd, pass, AeronScene_SceneRt((AeronScene3D*)user));
 }
 
+static void QuatToRows(const float q[4], float m[9]) {
+	const float w = q[0], x = q[1], y = q[2], z = q[3];
+	m[0] = 1 - 2 * (y * y + z * z);
+	m[1] = 2 * (x * y - w * z);
+	m[2] = 2 * (x * z + w * y);
+	m[3] = 2 * (x * y + w * z);
+	m[4] = 1 - 2 * (x * x + z * z);
+	m[5] = 2 * (y * z - w * x);
+	m[6] = 2 * (x * z - w * y);
+	m[7] = 2 * (y * z + w * x);
+	m[8] = 1 - 2 * (x * x + y * y);
+}
+
+static void RowsToQuat(const float m[9], float q[4]) {
+	const float trace = m[0] + m[4] + m[8];
+	if (trace > 0) {
+		const float sq = sqrtf(trace + 1) * 2;
+		q[0] = 0.25f * sq;
+		q[1] = (m[7] - m[5]) / sq;
+		q[2] = (m[2] - m[6]) / sq;
+		q[3] = (m[3] - m[1]) / sq;
+	} else if (m[0] > m[4] && m[0] > m[8]) {
+		const float sq = sqrtf(1 + m[0] - m[4] - m[8]) * 2;
+		q[0] = (m[7] - m[5]) / sq;
+		q[1] = 0.25f * sq;
+		q[2] = (m[1] + m[3]) / sq;
+		q[3] = (m[2] + m[6]) / sq;
+	} else if (m[4] > m[8]) {
+		const float sq = sqrtf(1 + m[4] - m[0] - m[8]) * 2;
+		q[0] = (m[2] - m[6]) / sq;
+		q[1] = (m[1] + m[3]) / sq;
+		q[2] = 0.25f * sq;
+		q[3] = (m[5] + m[7]) / sq;
+	} else {
+		const float sq = sqrtf(1 + m[8] - m[0] - m[4]) * 2;
+		q[0] = (m[3] - m[1]) / sq;
+		q[1] = (m[2] + m[6]) / sq;
+		q[2] = (m[5] + m[7]) / sq;
+		q[3] = 0.25f * sq;
+	}
+}
+
+/* Replaces the scene camera by one VR eye (as in the X-Wing Alliance port):
+ * the head pose relative to the seat is applied on top of the game ("body")
+ * camera and the projection becomes the eye's asymmetric frustum. Game eye
+ * axes are x right, y down, z forward; OpenXR's are x right, y up, -z
+ * forward (C = diag(1,-1,-1)). */
+static void ApplyVrEye(XvtRenderView* view, const XvtVrStereoEye* eye) {
+	AeronSceneCamera* camera = &view->camera;
+	float body[9], head[9], rel[9], rows[9];
+	const float q[4] = { eye->orientation[3], eye->orientation[0], eye->orientation[1], eye->orientation[2] };
+	QuatToRows(camera->ori, body); /* world -> body eye, rows = body axes */
+	QuatToRows(q, head);           /* head-local -> LOCAL, OpenXR axes */
+	for (int r = 0; r < 3; ++r)
+		for (int c = 0; c < 3; ++c)
+			rel[r * 3 + c] = head[r * 3 + c] * (r == 0 ? 1.0f : -1.0f) * (c == 0 ? 1.0f : -1.0f);
+	for (int r = 0; r < 3; ++r)
+		for (int c = 0; c < 3; ++c)
+			rows[r * 3 + c] =
+				rel[0 * 3 + r] * body[0 * 3 + c] + rel[1 * 3 + r] * body[1 * 3 + c] + rel[2 * 3 + r] * body[2 * 3 + c];
+	RowsToQuat(rows, camera->ori);
+	/* Eye position: seat-relative metres -> body game axes -> world units. */
+	const float upm = 1.0f / AERON_OPT_METERS_PER_UNIT;
+	const float local[3] = { eye->position_m[0] * upm, -eye->position_m[1] * upm, -eye->position_m[2] * upm };
+	for (int axis = 0; axis < 3; ++axis)
+		camera->pos[axis] +=
+			body[0 * 3 + axis] * local[0] + body[1 * 3 + axis] * local[1] + body[2 * 3 + axis] * local[2];
+	const float tl = eye->tan_left, tr = eye->tan_right, tu = eye->tan_up, td = eye->tan_down;
+	camera->h_half_rad = atanf((tl + tr) * 0.5f);
+	camera->v_half_rad = atanf((tu + td) * 0.5f);
+	camera->proj_x_offset = (tl - tr) / (tl + tr);
+	camera->proj_y_offset = (td - tu) / (tu + td);
+	camera->viewport = (AeronRectI) { 0, 0, eye->target_width, eye->target_height };
+	AeronScene_ComputeViewProj(camera, view->view_proj);
+}
+
 int XvtRemasterFlight_Render(AeronCommandBuffer* cmd, const XvtRenderSnapshot* s,
 							 const XvtRenderSnapshot* p) {
 	const XvtPreparedFlight* frame = XvtRemasterFlight_Current();
@@ -80,7 +163,16 @@ int XvtRemasterFlight_Render(AeronCommandBuffer* cmd, const XvtRenderSnapshot* s
 		g_outputValid = 0;
 		return 1;
 	}
-	if (s->camera.map_mode) {
+	if (g_eye) {
+		/* One head-tracked eye: no motion history, no HUD. */
+		memcpy(&g_eyeFrame, frame, sizeof g_eyeFrame);
+		ApplyVrEye(&g_eyeFrame.view, g_eye);
+		g_eyeFrame.previous_view = g_eyeFrame.view;
+		g_eyeFrame.reset_history = 1;
+		g_eyeFrame.regenerate_motion = 0;
+		g_eyeFrame.render_needed = 1;
+		frame = &g_eyeFrame;
+	} else if (s->camera.map_mode) {
 		if (!frame->render_needed && g_outputValid)
 			return 1;
 		g_outputValid = XvtFlightMap_Render(cmd, s, &frame->view);
@@ -200,12 +292,43 @@ int XvtRemasterFlight_Render(AeronCommandBuffer* cmd, const XvtRenderSnapshot* s
 	if (!streaks)
 		XvtEffects_Submit(g_scene, s, p, &s->camera, p ? (camera_motion ? &p->camera : &s->camera) : NULL,
 						  frame->regenerate_motion && !frame->reset_history, NULL);
+	if (g_eye) {
+		/* 3D cockpit at the body camera; the eye offset moves inside it. */
+		const XvtPreparedFlight* body = XvtRemasterFlight_Current();
+		XvtVrCockpit_Submit(g_scene, s, frame, body->view.camera.pos);
+		/* The HUD is drawn once into the overlay frame, not per eye. */
+		AeronScene_SetPassHook(g_scene, AERON_SCENE_HOOK_AFTER_UPSCALE, NULL, NULL);
+		return 1;
+	}
 	AeronScene_SetPassHook(g_scene, AERON_SCENE_HOOK_AFTER_UPSCALE, DrawHudAfterUpscale, g_scene);
 	if (!XvtFlightPipeline_Finish(cmd, g_scene))
 		return 0;
 	g_outputValid = 1;
 	return 1;
 }
+
+int XvtRemasterFlight_RenderEye(AeronCommandBuffer* cmd, const XvtRenderSnapshot* s, const XvtRenderSnapshot* p,
+								const XvtVrStereoEye* eye, int eye_index) {
+	if (!eye || !eye->target || eye->target_width <= 0 || eye->target_height <= 0 ||
+		eye->tan_left + eye->tan_right <= 0 || eye->tan_up + eye->tan_down <= 0)
+		return 0;
+	g_eye = eye;
+	XvtFlightPipeline_SetVrEye(1);
+	/* The second eye reuses the first eye's shadow cascades. */
+	if (g_scene)
+		AeronScene_SetDirectionalShadowReuse(g_scene, eye_index > 0);
+	int ok = XvtRemasterFlight_Render(cmd, s, p) && g_scene &&
+			 XvtFlightPipeline_ResolveVrEye(cmd, g_scene, eye->target, eye->target_width, eye->target_height);
+	if (g_scene)
+		AeronScene_SetDirectionalShadowReuse(g_scene, 0);
+	XvtFlightPipeline_SetVrEye(0);
+	g_eye = NULL;
+	/* The flat output now holds stale data until the HUD overlay replaces it. */
+	g_outputValid = 0;
+	return ok;
+}
+
+void XvtRemasterFlight_SetVrOverlayOutput(void) { g_outputValid = 1; }
 
 AeronTexture* XvtRemasterFlight_Output(void) { return g_outputValid ? XvtFlightPipeline_Output() : NULL; }
 

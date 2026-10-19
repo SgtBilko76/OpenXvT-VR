@@ -1,4 +1,6 @@
 #include "xvt_remaster/hud_draw.h"
+#include "xvt_remaster/vr_cockpit.h"
+#include "xvt/flight/hud/hud.h"
 #include "xvt_remaster/ui_draw.h"
 #include <math.h>
 
@@ -132,6 +134,11 @@ void XvtHudDraw_Part(const XvtHudDraw* draw, XvtHudSpriteRole role, unsigned sta
 void XvtHudDraw_Base(const XvtHudDraw* draw) {
 	const AeronRuntimeAtlas* atlas = &draw->assets->base;
 	if (!atlas->layout.frame_count)
+		return;
+	/* VR with a 3D cockpit: the original cockpit artwork (dashboard and
+	 * canopy frame) would hang in front of it; keep only the instruments. */
+	if (XvtVrCockpit_Active() &&
+		(draw->state->view.hud_state == HUD_VIEW_FORWARD || draw->state->view.hud_state == HUD_VIEW_HUD_ONLY))
 		return;
 	for (unsigned index = 0; index < draw->assets->base_coverage.count; ++index) {
 		const AeronImageCoverageRect* rect = &draw->assets->base_coverage.rects[index];

@@ -13,6 +13,7 @@
 #include "xvt_runtime/runtime/port.h"
 #include "xvt_runtime/snapshot/render_snapshot.h"
 #include "xvt_runtime/storage/storage.h"
+#include "xvt_vr/xvt_vr.h"
 #include <stdio.h>
 
 static uint64_t XvtApplication_PresentationIntervalUs(void) {
@@ -108,6 +109,8 @@ int XvtApplication_Run(const XvtLaunchOptions* options) {
 	}
 	XvtHostConfig_InitAeron(options, &config);
 	Aeron_LogInfo("xvt.app", "initializing OpenXvT %s host", OPENXVT_VERSION);
+	/* Quest/PICO: present through OpenXR instead of the Android window. */
+	XvtVr_Install();
 	if (!Aeron_Init(&config)) {
 		/* Aeron unwinds its own partial initialization; shutdown is idempotent. */
 		Aeron_Shutdown();

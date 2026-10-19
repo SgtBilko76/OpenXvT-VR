@@ -287,11 +287,13 @@ add_library(xvt_remaster STATIC
     src/xvt_remaster/config.c
     src/xvt_remaster/xvt_remaster.c
     src/xvt_remaster/view_mode.c
+    src/xvt_remaster/vr_stereo.c
+    src/xvt_remaster/vr_cockpit.c
 )
 target_include_directories(xvt_remaster PUBLIC src)
 target_link_libraries(xvt_remaster PUBLIC xvt_core aeron_scene aeron_asset)
 
-add_executable(xvt
+set(XVT_APP_SOURCES
     src/xvt_app/main.c
     src/xvt_app/application.c
     src/xvt_app/host_config.c
@@ -306,11 +308,22 @@ add_executable(xvt
     src/xvt_app/settings/keyboard_page.c
     src/xvt_app/settings/bindings_editor.c
     src/xvt_app/settings/controller_page.c
+    src/xvt_vr/xvt_vr.c
+    src/xvt_vr/vr_keyboard.c
 )
-set_target_properties(xvt PROPERTIES
-    OUTPUT_NAME "OpenXvT"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<0:>")
+if(ANDROID)
+    # Quest/PICO: SDLActivity loads the game as libmain.so and calls SDL_main().
+    add_library(xvt SHARED ${XVT_APP_SOURCES})
+    set_target_properties(xvt PROPERTIES OUTPUT_NAME "main")
+else()
+    add_executable(xvt ${XVT_APP_SOURCES})
+    set_target_properties(xvt PROPERTIES
+        OUTPUT_NAME "OpenXvT"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<0:>")
+endif()
 target_link_libraries(xvt PRIVATE xvt_remaster)
+target_include_directories(xvt PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/openxr/include)
 if(WIN32)
     set_target_properties(xvt PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()

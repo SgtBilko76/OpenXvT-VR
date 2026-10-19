@@ -20,8 +20,11 @@ struct VSOut
 
 VSOut main(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID)
 {
-    static const uint CORNERS[6] = { 0u, 1u, 2u, 0u, 2u, 3u };
-    uint corner_id = CORNERS[vertex_id % 6u];
+    /* Quad corners 0,1,2 / 0,2,3 computed instead of read from a `static
+     * const` table: Adreno (Quest) drivers read SPIR-V Private initialisers
+     * as zero, which collapsed every star quad. */
+    uint quad_vertex = vertex_id % 6u;
+    uint corner_id = quad_vertex < 3u ? quad_vertex : (quad_vertex == 3u ? 0u : quad_vertex - 2u);
     float2 corner = float2(
         (corner_id == 1u || corner_id == 2u) ? 1.0f : -1.0f,
         (corner_id == 2u || corner_id == 3u) ? 1.0f : -1.0f);

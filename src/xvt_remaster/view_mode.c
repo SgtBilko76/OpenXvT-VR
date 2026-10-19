@@ -75,6 +75,8 @@ int XvtRemasterView_NeedsWorld(const XvtRenderSnapshot* s) {
 			 !g_waitClassic);
 }
 
+int XvtRemasterView_ModernRequested(void) { return g_blend.target > 0 && !g_waitClassic; }
+
 int XvtRemasterView_Direct(const XvtRenderSnapshot* s, int width, int height) {
 	return s->flight_valid && s->scene_kind == XVT_SCENE_FLIGHT && g_worldReady &&
 		   s->mission_generation == g_mission && g_blend.target > 0 && g_blend.alpha >= 1 && !g_waitClassic &&

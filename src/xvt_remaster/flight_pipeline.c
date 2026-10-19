@@ -1,5 +1,6 @@
 #include "xvt_remaster/flight_pipeline.h"
 #include "aeron/aeron.h"
+#include "aeron/external_present.h"
 #include "aeron/scene/bloom.h"
 #include "aeron/scene/draw_list2d.h"
 #include "aeron/scene/present.h"
@@ -19,6 +20,15 @@ static float g_intensity;
 static int g_directWanted, g_retained;
 static AeronDrawList2D* g_bars;
 static int g_barsVisible;
+/* VR stereo (vr_stereo.h): eye renders skip temporal, SSAO and motion blur and
+ * resolve through their own eye-sized bloom/tonemap targets, so the flat
+ * HUD overlay keeps the normal presentation-sized ones. */
+static int g_vrEye;
+static AeronSceneBloom* g_eyeBloom;
+static AeronRenderTarget* g_eyeTarget;
+static int g_eyeWidth, g_eyeHeight;
+static AeronRenderTarget* g_hudTarget;
+static int g_hudWidth, g_hudHeight;
 
 void XvtFlightPipeline_ForgetSources(void) { g_color = g_bloomTexture = NULL; }
 
@@ -74,11 +84,17 @@ static int Ensure(int width, int height) {
 	return 1;
 }
 
+void XvtFlightPipeline_SetVrEye(int enabled) { g_vrEye = enabled; }
+
 void XvtFlightPipeline_Post(AeronScene3D* scene, float shutter, int motion) {
 	const XvtRenderSettings* settings = XvtRemasterConfig_Effective();
 	const AeronSceneSsaoSettings* a = &settings->scene.ssao;
 	const XvtMotionBlurSettings* m = &settings->motion_blur;
-	AeronScene_SetPost(scene, &(AeronScenePostDesc) { .ssao_quality = a->ssao_quality,
+	/* VR eyes: SSAO doubles with the eye count and its screen-space occlusion
+	 * does not match between the eyes; per-view motion history would mix. */
+	if (g_vrEye)
+		motion = 0;
+	AeronScene_SetPost(scene, &(AeronScenePostDesc) { .ssao_quality = g_vrEye ? 0 : a->ssao_quality,
 													  .ssao_intensity = a->ssao_intensity,
 													  .ssao_power = a->ssao_power,
 													  .ssao_radius_view = a->ssao_radius_view,
@@ -101,7 +117,10 @@ int XvtFlightPipeline_Begin(AeronScene3D* scene, const XvtRenderSnapshot* s, con
 	uint64_t now = Aeron_NowUs();
 	float delta_ms = g_lastHostUs && now > g_lastHostUs ? (float)(now - g_lastHostUs) / 1000 : 16.6667f;
 	g_lastHostUs = now;
-	AeronScene_SetTemporal(scene, &(AeronSceneTemporalDesc) { .mode = settings->temporal_mode,
+	if (g_vrEye)
+		reset = 1;
+	AeronScene_SetTemporal(scene, &(AeronSceneTemporalDesc) { .mode = g_vrEye ? AERON_TEMPORAL_OFF
+																			  : settings->temporal_mode,
 															  .frame_time_delta_ms = delta_ms,
 															  .sharpness = settings->temporal_sharpness,
 															  .reset_history = reset });
@@ -260,11 +279,116 @@ int XvtFlightPipeline_SubmitDirect(void) {
 										   .debug_label = "XvT flight direct presentation" });
 }
 
+int XvtFlightPipeline_ResolveVrEye(AeronCommandBuffer* cmd, AeronScene3D* scene, SDL_GPUTexture* destination,
+								   int destination_width, int destination_height) {
+	int width, height;
+	AeronScene_RtDims(scene, &width, &height);
+	if (!Ensure(g_width > 0 ? g_width : width, g_height > 0 ? g_height : height))
+		return 0;
+	if (!g_eyeTarget || g_eyeWidth != width || g_eyeHeight != height) {
+		AeronSceneBloom* bloom = AeronSceneBloom_Create(width, height);
+		AeronRenderTarget* target =
+			Aeron_CreateRenderTarget(&(AeronRenderTargetDesc) { .width = width,
+																.height = height,
+																.format = AERON_TEXTURE_FORMAT_RGBA16_FLOAT,
+																.debug_name = "xvt.flight.vr_eye" });
+		if (!bloom || !target) {
+			AeronSceneBloom_Destroy(bloom);
+			Aeron_DestroyRenderTarget(target);
+			return 0;
+		}
+		AeronSceneBloom_Destroy(g_eyeBloom);
+		Aeron_DestroyRenderTarget(g_eyeTarget);
+		g_eyeBloom = bloom;
+		g_eyeTarget = target;
+		g_eyeWidth = width;
+		g_eyeHeight = height;
+	}
+	if (!AeronScene_Render(scene, cmd))
+		return 0;
+	AeronTexture* color = Aeron_RenderTargetGetTexture(AeronScene_SceneRt(scene));
+	float intensity = XvtRemasterConfig_Effective()->bloom_intensity;
+	AeronTexture* bloom = NULL;
+	if (intensity > 0) {
+		if (!AeronSceneBloom_Apply(g_eyeBloom, cmd, color, width, height, height))
+			return 0;
+		bloom = Aeron_RenderTargetGetTexture(AeronSceneBloom_ColorRt(g_eyeBloom));
+		if (!bloom)
+			return 0;
+	}
+	AeronRenderPass* pass =
+		Aeron_BeginRenderPass(&(AeronRenderPassDesc) { .color_target = g_eyeTarget,
+													   .clear_color = 1,
+													   .clear_color_rgba = { 0, 0, 0, 1 },
+													   .command_buffer = cmd,
+													   .debug_label = "XvT VR eye tonemap" });
+	if (!pass)
+		return 0;
+	AeronScenePresentChain_Draw(g_present, pass, color, g_sampler, bloom, intensity, width, height, 1,
+								(const float[4]) { 1, 1, 1, 1 }, 0);
+	Aeron_EndRenderPass(pass);
+	return Aeron_BlitTextureToExternal(cmd, Aeron_RenderTargetGetTexture(g_eyeTarget), destination,
+									   destination_width, destination_height);
+}
+
+int XvtFlightPipeline_DrawVrHud(AeronCommandBuffer* cmd, int width, int height) {
+	if (!Ensure(width, height))
+		return 0;
+	if (!g_hudTarget || g_hudWidth != width || g_hudHeight != height) {
+		Aeron_DestroyRenderTarget(g_hudTarget);
+		g_hudTarget =
+			Aeron_CreateRenderTarget(&(AeronRenderTargetDesc) { .width = width,
+																.height = height,
+																.format = AERON_TEXTURE_FORMAT_RGBA16_FLOAT,
+																.debug_name = "xvt.flight.vr_hud" });
+		g_hudWidth = g_hudTarget ? width : 0;
+		g_hudHeight = g_hudTarget ? height : 0;
+		if (!g_hudTarget)
+			return 0;
+	}
+	/* The HUD and cockpit alone, over transparent black (linear HDR, like the
+	 * scene target they normally draw into after upscaling). */
+	AeronRenderPass* pass =
+		Aeron_BeginRenderPass(&(AeronRenderPassDesc) { .command_buffer = cmd,
+													   .color_target = g_hudTarget,
+													   .clear_color = 1,
+													   .clear_color_rgba = { 0, 0, 0, 0 },
+													   .debug_label = "XvT VR HUD overlay" });
+	if (!pass)
+		return 0;
+	XvtHudRenderer_Draw(cmd, pass, g_hudTarget);
+	Aeron_EndRenderPass(pass);
+	/* Tonemap into the presentation target, keeping coverage as alpha. */
+	pass = Aeron_BeginRenderPass(&(AeronRenderPassDesc) { .command_buffer = cmd,
+														  .color_target = g_target,
+														  .clear_color = 1,
+														  .clear_color_rgba = { 0, 0, 0, 0 },
+														  .debug_label = "XvT VR HUD tonemap" });
+	if (!pass)
+		return 0;
+	AeronScenePresentChain_Draw(g_present, pass, Aeron_RenderTargetGetTexture(g_hudTarget), g_sampler, NULL, 0,
+								width, height, 1, (const float[4]) { 1, 1, 1, 1 }, 1);
+	Aeron_EndRenderPass(pass);
+	g_color = Aeron_RenderTargetGetTexture(g_target);
+	g_bloomTexture = NULL;
+	g_directWanted = 0;
+	g_retained = 1;
+	g_barsVisible = 0;
+	return 1;
+}
+
 AeronTexture* XvtFlightPipeline_Output(void) {
 	return g_color && g_target ? Aeron_RenderTargetGetTexture(g_target) : NULL;
 }
 
 void XvtFlightPipeline_Shutdown(void) {
+	AeronSceneBloom_Destroy(g_eyeBloom);
+	Aeron_DestroyRenderTarget(g_eyeTarget);
+	Aeron_DestroyRenderTarget(g_hudTarget);
+	g_eyeBloom = NULL;
+	g_eyeTarget = g_hudTarget = NULL;
+	g_eyeWidth = g_eyeHeight = g_hudWidth = g_hudHeight = 0;
+	g_vrEye = 0;
 	AeronDrawList_Destroy(g_bars);
 	g_bars = NULL;
 	g_barsVisible = 0;

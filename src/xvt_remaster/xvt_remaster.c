@@ -12,6 +12,8 @@
 #include "xvt_remaster/hud_renderer.h"
 #include "xvt_remaster/preview.h"
 #include "xvt_remaster/view_mode.h"
+#include "xvt_remaster/vr_cockpit.h"
+#include "xvt_remaster/vr_stereo.h"
 #include "xvt_runtime/snapshot/render_assets.h"
 #include "xvt_runtime/snapshot/render_snapshot.h"
 
@@ -58,6 +60,7 @@ void XvtRemaster_Frame(int32_t delta_us) {
 	int assets_ready = 1;
 	if (!g_initialized)
 		return;
+	XvtRemasterVr_SetRendered(0, NULL);
 	snapshot = XvtRenderSnapshot_Current();
 	if (!snapshot)
 		return;
@@ -140,7 +143,10 @@ void XvtRemaster_Frame(int32_t delta_us) {
 	if (!assets_ready)
 		XvtRemasterFlight_Invalidate();
 	XvtFlightPipeline_SetDirect(0, width, height);
-	int direct = assets_ready && XvtRemasterView_Direct(snapshot, width, height);
+	/* VR: head tracking needs a fresh pair of eyes every host frame. */
+	const XvtVrStereoFrame* vr = XvtRemasterVr_PublishedFrame();
+	int stereo = frame && vr && XvtRemasterVr_Wanted(snapshot) && XvtRemasterView_ModernRequested();
+	int direct = !vr && assets_ready && XvtRemasterView_Direct(snapshot, width, height);
 	int standalone = world_needed && !snapshot->flight_valid && snapshot->cockpit.valid &&
 					 snapshot->presented_target == XVT_TARGET_FLIGHT_MAIN;
 	int crt_dirty = frame && XvtRemasterPreview_CrtNeedsRender(snapshot, width, height);
@@ -152,7 +158,7 @@ void XvtRemaster_Frame(int32_t delta_us) {
 													frame ? &frame->view : NULL, crt_visible, width, height);
 	if (frame && (hud_dirty || crt_dirty))
 		XvtRemasterFlight_RequestComposition();
-	int render_flight = frame && (frame->render_needed || !XvtRemasterFlight_Output());
+	int render_flight = frame && (stereo || frame->render_needed || !XvtRemasterFlight_Output());
 	if (render_flight || (standalone && hud_dirty) || frontend_replay || XvtFlightPipeline_NeedsRetain()) {
 		AeronCommandBuffer* cmd = Aeron_AcquireCommandBuffer();
 		if (!cmd) {
@@ -160,6 +166,8 @@ void XvtRemaster_Frame(int32_t delta_us) {
 			return;
 		}
 		int ok = 1;
+		/* Before the HUD is built: an active 3D cockpit hides the 2D artwork. */
+		XvtVrCockpit_Prepare(cmd, stereo ? snapshot : NULL);
 		if (render_flight)
 			ok = XvtRemasterPreview_RenderCrt(cmd, snapshot, width, height);
 		if (ok && (render_flight || (standalone && hud_dirty)))
@@ -167,7 +175,14 @@ void XvtRemaster_Frame(int32_t delta_us) {
 										frame ? snapshot->target_boxes : NULL,
 										frame ? snapshot->target_box_count : 0, frame ? &frame->view : NULL,
 										frame ? XvtRemasterPreview_CrtLinear() : NULL, width, height);
-		if (ok && render_flight)
+		if (ok && stereo) {
+			for (int eye = 0; ok && eye < 2; ++eye)
+				ok = XvtRemasterFlight_RenderEye(cmd, snapshot, XvtRenderSnapshot_Previous(), &vr->eyes[eye], eye);
+			if (ok)
+				ok = XvtFlightPipeline_DrawVrHud(cmd, width, height);
+			if (ok)
+				XvtRemasterFlight_SetVrOverlayOutput();
+		} else if (ok && render_flight)
 			ok = XvtRemasterFlight_Render(cmd, snapshot, XvtRenderSnapshot_Previous());
 		if (ok && standalone && hud_dirty)
 			ok = XvtFlightPipeline_DrawStandaloneHud(cmd, width, height);
@@ -190,6 +205,7 @@ void XvtRemaster_Frame(int32_t delta_us) {
 			return;
 		}
 		XvtRemasterAssets_CommitImages();
+		XvtRemasterVr_SetRendered(stereo, frame);
 	}
 	/* Finish the last ordered frontend replay before retiring its GPU sources. */
 	if (snapshot->frontend_surfaces_released && !g_frontendSurfacesReleased) {
@@ -204,6 +220,7 @@ void XvtRemaster_Frame(int32_t delta_us) {
 }
 
 void XvtRemaster_Shutdown(void) {
+	XvtVrCockpit_Shutdown();
 	XvtComponentAnimation_Reset();
 	XvtRemasterView_Shutdown();
 	XvtFrontend_Shutdown();

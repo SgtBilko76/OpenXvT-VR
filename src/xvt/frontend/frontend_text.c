@@ -48,6 +48,9 @@ typedef HRESULT(AERON_DXAPI* FrontendTextSurfaceReleaseDcFunc)(IDirectDrawSurfac
 static int g_savedGlyphScratchTtl;
 // GLOBAL: XVT 0x52C000
 int g_activeTextFieldId = 0;
+/* OpenXvT: bumped every frame a text field takes keyboard input, so the Quest
+ * VR layer knows when to show its virtual keyboard. */
+unsigned int g_textFieldEditSerial;
 // GLOBAL: XVT 0x52C014
 static int g_textFieldColor = 0;
 // GLOBAL: XVT 0x52C018
@@ -85,6 +88,7 @@ int FrontendText_DrawEditableField(RECT* rect, char* text, int maxChars, int fie
 	XvtRenderFrontend_TextEntry(fieldId);
 #endif
 	if (g_activeTextFieldId == fieldId) {
+		++g_textFieldEditSerial;
 		uint8_t inputChar = Keyboard_PeekChar();
 		if (ignoredChars != NULL) {
 			int ignoredIndex;

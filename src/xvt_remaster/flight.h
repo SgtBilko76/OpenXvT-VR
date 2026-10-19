@@ -36,6 +36,13 @@ int XvtRemasterFlight_Render(AeronCommandBuffer* cmd, const XvtRenderSnapshot* c
 AeronTexture* XvtRemasterFlight_Output(void);
 void XvtRemasterFlight_Shutdown(void);
 int XvtRemasterFlight_PrepareResources(int width, int height);
+/* VR stereo (vr_stereo.h): renders the current frame for one head-tracked eye
+ * (no HUD) straight into the eye's host image. */
+struct XvtVrStereoEye;
+int XvtRemasterFlight_RenderEye(AeronCommandBuffer* cmd, const XvtRenderSnapshot* current,
+								const XvtRenderSnapshot* previous, const struct XvtVrStereoEye* eye, int eye_index);
+/* Marks the HUD-only overlay drawn by XvtFlightPipeline_DrawVrHud as the output. */
+void XvtRemasterFlight_SetVrOverlayOutput(void);
 #ifdef __cplusplus
 }
 #endif

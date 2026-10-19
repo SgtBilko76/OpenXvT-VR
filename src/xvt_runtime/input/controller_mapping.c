@@ -1,7 +1,9 @@
 #include "xvt_runtime/input/controller_mapping.h"
 #include "aeron/debug.h"
 #include "aeron/log.h"
+#include "xvt/flight/craft.h"
 #include "xvt/flight/flight_input.h"
+#include "xvt/flight/object/object.h"
 #include "xvt/flight/player/player.h"
 #include "xvt_runtime/input/capture.h"
 #include "xvt_runtime/runtime/dialog_task.h"
@@ -73,6 +75,27 @@ static void XvtControllerMapping_DispatchAction(XvtInputAction action, bool pres
 
 static void XvtControllerMapping_Dispatch(XvtInputAction action, bool pressed) {
 	uint16_t key = XvtInputActions_Key(action);
+#ifdef __ANDROID__
+	/* VR bring-up: trace controller commands (logcat tag SDL/APP, "xvt.vrinput"). */
+	if ((unsigned)g_localPlayer < 8)
+		Aeron_LogInfo("xvt.vrinput", "%s %s (holds %u, flight %d, weapon mode %u, warhead %u)",
+					  XvtInputActions_ToName(action), pressed ? "down" : "up", (unsigned)g_controller.holds[action],
+					  XvtFlightTask_IsActive() && !XvtFlightTask_IsLoading(),
+					  (unsigned)g_players[g_localPlayer].selectedWeaponMode,
+					  (unsigned)g_players[g_localPlayer].selectedWarhead);
+	if (pressed && action == XVT_INPUT_ACTION_FIRE_WEAPON && (unsigned)g_localPlayer < 8 && g_objectTable &&
+		XvtFlightTask_IsActive() && !XvtFlightTask_IsLoading()) {
+		const ObjectRecord* object = &g_objectTable[g_players[g_localPlayer].objectIndex];
+		const CraftData*    craft  = object->mobj ? object->mobj->pCraft : NULL;
+		if (craft)
+			Aeron_LogInfo("xvt.vrinput",
+						  "  cannons %s, charge %d %d %d %d, recharge rate %d, fire inhibit %d",
+						  (craft->workingSubsystems & CRAFT_SUBSYSTEM_FLAG_CANNONS) ? "working" : "DAMAGED",
+						  craft->weaponSlots[0].laserCharge, craft->weaponSlots[1].laserCharge,
+						  craft->weaponSlots[2].laserCharge, craft->weaponSlots[3].laserCharge,
+						  (int)craft->laserRedirect, (int)craft->weaponFireInhibitTimer);
+	}
+#endif
 	bool held = action == XVT_INPUT_ACTION_FIRE_WEAPON || action == XVT_INPUT_ACTION_TARGET_ROLL_MODIFIER ||
 				(key >= FLIGHT_KEY_PAD_1 && key <= FLIGHT_KEY_PAD_9) || key == FLIGHT_KEY_PAD_0;
 	if (held) {
@@ -190,6 +213,9 @@ const XvtControllerOptions* XvtControllerMapping_Options(void) { return &g_contr
 void XvtControllerMapping_Suspend(void) {
 	if (g_controller.suspended)
 		return;
+#ifdef __ANDROID__
+	Aeron_LogInfo("xvt.vrinput", "controller suspended");
+#endif
 	/* Drop the entire route without dispatching synthetic gameplay releases. */
 	memset(g_controller.instances, 0, sizeof g_controller.instances);
 	memset(g_controller.holds, 0, sizeof g_controller.holds);
@@ -430,6 +456,9 @@ uint16_t XvtControllerMapping_ReadKey(void) {
 }
 
 void XvtControllerMapping_ReleaseCommands(void) {
+#ifdef __ANDROID__
+	Aeron_LogInfo("xvt.vrinput", "controller commands released");
+#endif
 	g_controller.read = g_controller.write = 0;
 	memset(g_controller.holds, 0, sizeof g_controller.holds);
 	for (int i = 0; i < AERON_CONTROLLER_MAX; ++i) {
