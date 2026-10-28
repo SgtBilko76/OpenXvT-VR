@@ -2,13 +2,14 @@
  *
  * The game keeps rendering a normal flat frame; Aeron composes that frame into
  * an OpenXR swapchain (external presentation hooks) which is shown as a large
- * virtual screen in front of the player, over Quest passthrough in the menus
- * and over black space in flight.
+ * virtual screen in front of the player, over black in the menus and over
+ * space in flight.
  *
  * Touch controllers:
- *  - a virtual SDL gamepad (sticks, throttle, fire, target-in-sights) that the
+ *  - a virtual SDL gamepad (sticks, throttle, fire, targeting) that the
  *    game's existing controller support picks up,
- *  - injected keyboard shortcuts for the remaining flight commands,
+ *  - in-flight radial menus (vr_radial_menu.c) on both grips that type the
+ *    game's keyboard shortcuts for everything else,
  *  - a laser pointer + clicks for the mouse-driven menus,
  *  - a virtual keyboard (vr_keyboard.c) while a text field takes input.
  */
@@ -25,9 +26,12 @@
 #include "aeron/aeron.h"
 #include "aeron/external_present.h"
 #include "xvt_remaster/vr_stereo.h"
+#include "xvt_vr/vr_radial_menu.h"
 #include "xvt_vr/vr_keyboard.h"
 #include "xvt/frontend/frontend_text.h"
 #include "xvt_runtime/runtime/flight_task.h"
+#include "xvt_runtime/input/actions.h"
+#include "xvt_runtime/input/controller_mapping.h"
 #include "xvt_app/settings/settings.h"
 
 #include <math.h>
@@ -46,8 +50,8 @@ enum {
 #define VR_REFRESH_HZ 72.0f
 
 #define VR_PAD_VENDOR_ID  0x2833 /* Oculus VR */
-#define VR_PAD_PRODUCT_ID 0x7857
-#define VR_PAD_ID_HINT    "0x2833/0x7857"
+#define VR_PAD_PRODUCT_ID 0x7858 /* 0.1.1: radial menu layout (0x7857 = 0.1.0) */
+#define VR_PAD_ID_HINT    "0x2833/0x7858"
 
 /* Virtual screen: metres in LOCAL space (origin = head at recenter). */
 static const float VR_SCREEN_DISTANCE     = 2.5f;
@@ -65,6 +69,34 @@ static const float    VR_KB_HEIGHT     = -0.55f;
 static const float    VR_KB_TILT_DEG   = -35.0f;
 static const float    VR_KB_WIDTH_M    = 1.1f;
 static const uint64_t VR_KB_LINGER_MS  = 300; /* hide after the field stops asking for text */
+/* Radial menus: a panel above the controller, facing the head. */
+static const float    VR_RADIAL_SIZE_M     = 0.30f;
+static const float    VR_RADIAL_LIFT_M     = 0.17f; /* panel centre above the controller */
+static const float    VR_RADIAL_PICK       = 0.55f; /* stick deflection that selects */
+static const float    VR_RADIAL_KEEP       = 0.30f; /* ...and keeps the selection */
+static const uint64_t VR_RADIAL_LINGER_MS  = 250;   /* selection survives the stick springing back */
+
+/* A quad layer with its own swapchain, drawn on the CPU (radial menus). */
+typedef struct VrPanel {
+	XrSwapchain            swapchain;
+	SDL_GPUTexture**       images;
+	SDL_GPUTransferBuffer* transfer;
+	uint8_t*               pixels;
+	int                    width, height;
+	int                    ever_released;
+	int                    dirty;
+} VrPanel;
+
+typedef struct VrRadialState {
+	VrPanel  panel;
+	int      visible;
+	int      selected;      /* VR_RADIAL_NONE or item */
+	int      drawn_selected;
+	int      suppressed;    /* this hold chooses nothing */
+	uint64_t selected_ms;   /* last time the stick pointed at `selected` */
+	XrPosef  pose;          /* panel pose in LOCAL space */
+	int      pose_valid;
+} VrRadialState;
 
 typedef enum VrHand { VR_LEFT = 0, VR_RIGHT = 1, VR_HAND_COUNT = 2 } VrHand;
 
@@ -120,11 +152,6 @@ typedef enum VrKeySlot {
 	X(xrLocateViews)
 XR_FUNCTIONS(XR_FN)
 static PFN_xrGetInstanceProcAddr       p_xrGetInstanceProcAddr;
-static PFN_xrCreatePassthroughFB       p_xrCreatePassthroughFB;
-static PFN_xrPassthroughStartFB        p_xrPassthroughStartFB;
-static PFN_xrCreatePassthroughLayerFB  p_xrCreatePassthroughLayerFB;
-static PFN_xrDestroyPassthroughFB      p_xrDestroyPassthroughFB;
-static PFN_xrDestroyPassthroughLayerFB p_xrDestroyPassthroughLayerFB;
 static PFN_xrGetDisplayRefreshRateFB   p_xrGetDisplayRefreshRateFB;
 static PFN_xrRequestDisplayRefreshRateFB p_xrRequestDisplayRefreshRateFB;
 
@@ -155,11 +182,6 @@ static struct {
 	int                   views_valid;
 	int                   stereo_published;
 	float                 screen_width_m;
-	/* Passthrough (XR_FB_passthrough) */
-	int                   want_passthrough;
-	int                   has_passthrough;
-	XrPassthroughFB       passthrough;
-	XrPassthroughLayerFB  passthrough_layer;
 	/* Input */
 	XrActionSet           action_set;
 	XrAction              act_aim;
@@ -207,9 +229,13 @@ static struct {
 	unsigned int          kb_serial;
 	uint64_t              kb_active_ms;
 	VrKeyboard            kb;
-	int                   kb_hit[VR_HAND_COUNT];
+	int                   kb_hit[VR_HAND_COUNT]; /* ray on the panel (keyboard or command menu) */
 	int                   kb_held_key[VR_HAND_COUNT];
 	uint64_t              kb_repeat_ms[VR_HAND_COUNT];
+	/* In-flight radial menus, one per hand */
+	VrRadialState         radial[VR_HAND_COUNT];
+	int                   panel_bgra;
+	XrVector3f            head_pos;        /* last known head position (LOCAL) */
 } g_vr;
 
 /* ------------------------------------------------------------------------ */
@@ -254,18 +280,20 @@ static float vr_screen_height_m(void) {
 /* ------------------------------------------------------------------------ */
 /* Event injection                                                          */
 
-static void vr_push_key(SDL_Scancode scancode, int down) {
+static void vr_push_key_mod(SDL_Scancode scancode, int down, SDL_Keymod mod) {
 	SDL_Event event;
 
 	SDL_zero(event);
 	event.type          = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
 	event.key.timestamp = SDL_GetTicksNS();
 	event.key.scancode  = scancode;
-	event.key.key       = SDL_GetKeyFromScancode(scancode, SDL_KMOD_NONE, false);
-	event.key.mod       = SDL_KMOD_NONE;
+	event.key.key       = SDL_GetKeyFromScancode(scancode, mod, false);
+	event.key.mod       = mod;
 	event.key.down      = down ? true : false;
 	SDL_PushEvent(&event);
 }
+
+static void vr_push_key(SDL_Scancode scancode, int down) { vr_push_key_mod(scancode, down, SDL_KMOD_NONE); }
 
 /* Holds `scancode` in `slot` while `pressed`; a slot changing its key while
  * held (mode switch) releases the old key first. */
@@ -406,11 +434,6 @@ static int vr_load_functions(void) {
 #undef XR_LOAD
 #define XR_LOAD_OPTIONAL(name) \
 	p_xrGetInstanceProcAddr(g_vr.instance, #name, (PFN_xrVoidFunction*)&p_##name);
-	XR_LOAD_OPTIONAL(xrCreatePassthroughFB)
-	XR_LOAD_OPTIONAL(xrPassthroughStartFB)
-	XR_LOAD_OPTIONAL(xrCreatePassthroughLayerFB)
-	XR_LOAD_OPTIONAL(xrDestroyPassthroughFB)
-	XR_LOAD_OPTIONAL(xrDestroyPassthroughLayerFB)
 	XR_LOAD_OPTIONAL(xrGetDisplayRefreshRateFB)
 	XR_LOAD_OPTIONAL(xrRequestDisplayRefreshRateFB)
 #undef XR_LOAD_OPTIONAL
@@ -423,7 +446,6 @@ static int         g_vr_extension_count;
 
 static void vr_pick_extensions(void) {
 	static const char* const wanted[] = {
-		XR_FB_PASSTHROUGH_EXTENSION_NAME,
 		XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME,
 		/* PICO 4 / Neo 3 controllers (same button layout as Touch). */
 		"XR_BD_controller_interaction",
@@ -465,9 +487,7 @@ static void vr_pick_extensions(void) {
 	SDL_free(props);
 	for (int i = 0; i < g_vr_extension_count; ++i) {
 		Aeron_LogInfo(VR_LOG, "requesting OpenXR extension %s", g_vr_extensions[i]);
-		if (strcmp(g_vr_extensions[i], XR_FB_PASSTHROUGH_EXTENSION_NAME) == 0) {
-			g_vr.want_passthrough = 1;
-		} else if (strcmp(g_vr_extensions[i], "XR_BD_controller_interaction") == 0) {
+		if (strcmp(g_vr_extensions[i], "XR_BD_controller_interaction") == 0) {
 			g_vr.has_bd_controllers = 1;
 		}
 	}
@@ -593,29 +613,6 @@ static int vr_create_actions(void) {
 	return 1;
 }
 
-static void vr_create_passthrough(void) {
-	XrPassthroughCreateInfoFB      create = { XR_TYPE_PASSTHROUGH_CREATE_INFO_FB };
-	XrPassthroughLayerCreateInfoFB layer  = { XR_TYPE_PASSTHROUGH_LAYER_CREATE_INFO_FB };
-
-	if (!g_vr.want_passthrough || !p_xrCreatePassthroughFB || !p_xrCreatePassthroughLayerFB ||
-		!p_xrPassthroughStartFB) {
-		return;
-	}
-	create.flags = XR_PASSTHROUGH_IS_RUNNING_AT_CREATION_BIT_FB;
-	if (!vr_ok(p_xrCreatePassthroughFB(g_vr.session, &create, &g_vr.passthrough), "xrCreatePassthroughFB")) {
-		return;
-	}
-	layer.passthrough = g_vr.passthrough;
-	layer.flags       = XR_PASSTHROUGH_IS_RUNNING_AT_CREATION_BIT_FB;
-	layer.purpose     = XR_PASSTHROUGH_LAYER_PURPOSE_RECONSTRUCTION_FB;
-	if (!vr_ok(p_xrCreatePassthroughLayerFB(g_vr.session, &layer, &g_vr.passthrough_layer),
-			   "xrCreatePassthroughLayerFB")) {
-		return;
-	}
-	g_vr.has_passthrough = 1;
-	Aeron_LogInfo(VR_LOG, "passthrough enabled for menus");
-}
-
 static SDL_GPUTextureFormat vr_pick_format(int* out_ok) {
 	static const SDL_GPUTextureFormat preferred[] = {
 		SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB,
@@ -647,6 +644,7 @@ static SDL_GPUTextureFormat vr_pick_format(int* out_ok) {
 }
 
 static void vr_create_keyboard(SDL_GPUTextureFormat format, const XrSwapchainCreateInfo* base);
+static void vr_create_radials(SDL_GPUTextureFormat format, const XrSwapchainCreateInfo* base);
 
 static int vr_device_created(SDL_GPUDevice* device, AeronExternalPresentTarget* target, void* userdata) {
 	XrSessionCreateInfo        session_info = { XR_TYPE_SESSION_CREATE_INFO };
@@ -686,6 +684,7 @@ static int vr_device_created(SDL_GPUDevice* device, AeronExternalPresentTarget* 
 		return 0;
 	}
 	vr_create_keyboard(format, &swap_info);
+	vr_create_radials(format, &swap_info);
 
 	{
 		XrViewConfigurationView config[2] = { { XR_TYPE_VIEW_CONFIGURATION_VIEW },
@@ -716,7 +715,6 @@ static int vr_device_created(SDL_GPUDevice* device, AeronExternalPresentTarget* 
 	if (!vr_create_actions()) {
 		return 0;
 	}
-	vr_create_passthrough();
 
 	g_vr.refresh_hz = 72.0f;
 	/* Pin the panel rate: an unpinned rate drifts and the frame pacing
@@ -732,7 +730,7 @@ static int vr_device_created(SDL_GPUDevice* device, AeronExternalPresentTarget* 
 		}
 	}
 	g_vr.screen_width_m = VR_SCREEN_WIDTH_MENU;
-	g_vr.pointer_hand   = VR_RIGHT;
+	g_vr.pointer_hand   = VR_LEFT;
 	vr_create_pad();
 
 	target->format     = format;
@@ -889,14 +887,21 @@ static int vr_pointer_hit(VrHand hand, float* out_x, float* out_y) {
 static void vr_update_pointer(void) {
 	float x, y;
 
-	/* The hand that last pulled its trigger owns the pointer. */
-	for (int hand = 0; hand < VR_HAND_COUNT; ++hand) {
-		if (g_vr.trigger[hand] > 0.65f && !g_vr.trigger_down[hand]) {
-			g_vr.pointer_hand = (VrHand)hand;
+	/* No laser in the OpenXvT settings overlay (gamepad only there). In the
+	 * main menus either controller is the mouse (the hand that last pulled
+	 * its trigger); in a mission only the left one. */
+	if (vr_in_flight()) {
+		g_vr.pointer_hand = VR_LEFT;
+	} else {
+		for (int hand = 0; hand < VR_HAND_COUNT; ++hand) {
+			if (g_vr.trigger[hand] > 0.65f && !g_vr.trigger_down[hand]) {
+				g_vr.pointer_hand = (VrHand)hand;
+			}
 		}
 	}
 	/* A ray on the virtual keyboard doesn't also point at the screen. */
-	g_vr.pointer_valid = !g_vr.kb_hit[g_vr.pointer_hand] && vr_pointer_hit(g_vr.pointer_hand, &x, &y);
+	g_vr.pointer_valid = !XvtSettingsMenu_Open() && !g_vr.kb_hit[g_vr.pointer_hand] &&
+						 vr_pointer_hit(g_vr.pointer_hand, &x, &y);
 	if (g_vr.pointer_valid) {
 		g_vr.pointer_x = x;
 		g_vr.pointer_y = y;
@@ -906,9 +911,11 @@ static void vr_update_pointer(void) {
 
 static void vr_update_mouse_buttons(int in_flight) {
 	const VrHand hand       = g_vr.pointer_hand;
-	const int    left_down  = !in_flight && vr_hysteresis(g_vr.mouse_left_down, g_vr.trigger[hand]);
-	/* In flight the right grip targets; in menus it right-clicks. */
-	const int    right_down = !in_flight && vr_hysteresis(g_vr.mouse_right_down, g_vr.grip[VR_RIGHT]);
+	const int    laser      = !in_flight && !XvtSettingsMenu_Open();
+	const int    left_down  = laser && vr_hysteresis(g_vr.mouse_left_down, g_vr.trigger[hand]);
+	/* In game menus the laser hand's grip right-clicks (in flight the grips
+	 * open the radial menus). */
+	const int    right_down = laser && vr_hysteresis(g_vr.mouse_right_down, g_vr.grip[hand]);
 
 	if (left_down != g_vr.mouse_left_down) {
 		if (!left_down || g_vr.pointer_valid) {
@@ -924,28 +931,24 @@ static void vr_update_mouse_buttons(int in_flight) {
 	}
 }
 
-/* The Touch controllers as one gamepad, mirrored 1:1 so every input can be
- * bound in the game's own controller options (defaults in config.yaml):
- *   right stick -> right x/y, left stick x -> left x, triggers -> trigger axes,
- *   A/B/X/Y -> south/east/west/north, right grip -> right shoulder,
- *   stick clicks -> left/right stick, menu -> start.
- * Left stick y is a throttle lever: pushing it moves the lever, releasing it
- * leaves the lever where it is (the game applies the throttle axis only when
- * it changes, so a spring-centred stick would keep snapping to half speed).
- * The left grip is a shift key: while held, Y/B/A/X become D-pad
- * up/right/down/left, the left trigger becomes the left shoulder and the
- * right grip becomes misc1.
- * Stick clicks: physical right click = guide (hyperspace), left grip + right
- * click = left stick (match speed); physical left click = right stick,
- * left grip + left click = back. */
+/* The Touch controllers as one gamepad, so every flight input can be bound
+ * in the game's own controller options (defaults in config.yaml):
+ *   physical left stick -> right x/y (pitch/yaw), physical right stick x ->
+ *   left x (roll), triggers -> trigger axes, A/B/X/Y -> south/east/west/north,
+ *   physical left/right stick click -> right/left stick button, menu -> start.
+ * Physical right stick y is a throttle lever: pushing it moves the lever,
+ * releasing it leaves the lever where it is (the game applies the throttle
+ * axis only when it changes, so a spring-centred stick would keep snapping to
+ * half speed). The grips open the radial menus (vr_update_radials); a stick
+ * choosing in its menu sends nothing to the pad. */
 static void vr_update_gamepad(int in_flight, float dt) {
 	/* Sticks swapped: physical right stick = roll + throttle lever, physical
 	 * left stick = pitch/yaw; the stick clicks swap with them. */
 	const XrVector2f left  = g_vr.stick[VR_RIGHT];
 	const XrVector2f right = g_vr.stick[VR_LEFT];
-	const int        shift = g_vr.grip[VR_LEFT] > 0.5f;
 	float            roll;
 	float            lever_input;
+	float            trigger[VR_HAND_COUNT];
 
 	if (!g_vr.pad) {
 		return;
@@ -953,6 +956,11 @@ static void vr_update_gamepad(int in_flight, float dt) {
 	/* The dominant left-stick direction wins so moving the lever doesn't roll. */
 	roll        = SDL_fabsf(left.x) > SDL_fabsf(left.y) * 0.75f ? left.x : 0.0f;
 	lever_input = SDL_fabsf(left.y) > SDL_fabsf(left.x) * 0.75f ? left.y : 0.0f;
+	/* A stick that is choosing in its radial menu doesn't fly. */
+	if (g_vr.radial[VR_RIGHT].visible) {
+		roll        = 0.0f;
+		lever_input = 0.0f;
+	}
 	if (in_flight && SDL_fabsf(lever_input) > 0.2f) {
 		g_vr.throttle += lever_input * 0.6f * dt;
 		if (g_vr.throttle < 0.0f) {
@@ -961,70 +969,85 @@ static void vr_update_gamepad(int in_flight, float dt) {
 			g_vr.throttle = 1.0f;
 		}
 	}
+	for (int hand = 0; hand < VR_HAND_COUNT; ++hand) {
+		trigger[hand] = g_vr.trigger[hand];
+	}
 
 	SDL_LockJoysticks();
 	if (!in_flight) {
-		/* Menus own the controllers: report a neutral pad (the lever too; the
-		 * settings overlay navigates with the left stick). */
+		/* Menus. The throttle lever is never reported here: it stays in
+		 * g_vr.throttle and comes back (as a change) when flight resumes
+		 * (reporting it made the settings list scroll forever). Game menus get
+		 * a neutral pad (the laser is the pointer). The OpenXvT settings
+		 * overlay is gamepad only, left controller: stick = focus, X = select
+		 * (south), Y = back (east), left trigger / grip = previous / next page
+		 * (shoulders). */
+		const int        settings   = XvtSettingsMenu_Open();
+		const XrVector2f menu_stick = g_vr.stick[VR_LEFT];
 		for (int b = 0; b <= SDL_GAMEPAD_BUTTON_MISC1; ++b) {
 			SDL_SetJoystickVirtualButton(g_vr.pad, b, 0);
 		}
+		SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_SOUTH, settings && g_vr.button_x);
+		SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_EAST, settings && g_vr.button_y);
+		SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,
+									 settings && vr_hysteresis(g_vr.trigger_down[VR_LEFT], g_vr.trigger[VR_LEFT]));
+		SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,
+									 settings && vr_hysteresis(g_vr.grip_down[VR_LEFT], g_vr.grip[VR_LEFT]));
 		SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_RIGHTX, 0);
 		SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_RIGHTY, 0);
-		SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_LEFTX, 0);
-		SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_LEFTY, 0);
+		SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_LEFTX, settings ? vr_axis(menu_stick.x) : 0);
+		SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_LEFTY, settings ? vr_axis(-menu_stick.y) : 0);
 		SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, vr_trigger_axis(0.0f));
 		SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, vr_trigger_axis(0.0f));
 		SDL_UnlockJoysticks();
 		return;
 	}
-	SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_RIGHTX, vr_axis(right.x));
-	SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_RIGHTY, vr_axis(-right.y)); /* SDL: up is negative */
+	SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_RIGHTX,
+							   g_vr.radial[VR_LEFT].visible ? 0 : vr_axis(right.x));
+	SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_RIGHTY,
+							   g_vr.radial[VR_LEFT].visible ? 0 : vr_axis(right.y)); /* inverted pitch: stick up = SDL down = nose down */
 	SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_LEFTX, vr_axis(roll));
 	SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_LEFTY, vr_axis(g_vr.throttle * 2.0f - 1.0f));
-	SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, vr_trigger_axis(shift ? 0.0f : g_vr.trigger[VR_LEFT]));
-	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,
-								 shift && vr_hysteresis(g_vr.trigger_down[VR_LEFT], g_vr.trigger[VR_LEFT]));
-	SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, vr_trigger_axis(g_vr.trigger[VR_RIGHT]));
-	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_SOUTH, !shift && g_vr.button_a);
-	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_EAST, !shift && g_vr.button_b);
-	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_WEST, !shift && g_vr.button_x);
-	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_NORTH, !shift && g_vr.button_y);
-	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_DPAD_DOWN, shift && g_vr.button_a);
-	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, shift && g_vr.button_b);
-	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_DPAD_LEFT, shift && g_vr.button_x);
-	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_DPAD_UP, shift && g_vr.button_y);
-	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,
-								 !shift && vr_hysteresis(g_vr.grip_down[VR_RIGHT], g_vr.grip[VR_RIGHT]));
-	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_MISC1,
-								 shift && vr_hysteresis(g_vr.grip_down[VR_RIGHT], g_vr.grip[VR_RIGHT]));
-	/* Right stick click alone = guide (hyperspace), with left grip = left stick (match speed). */
-	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_GUIDE, !shift && g_vr.stick_click[VR_RIGHT]);
-	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_LEFT_STICK, shift && g_vr.stick_click[VR_RIGHT]);
-	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_RIGHT_STICK, !shift && g_vr.stick_click[VR_LEFT]);
-	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_BACK, shift && g_vr.stick_click[VR_LEFT]);
+	SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, vr_trigger_axis(trigger[VR_LEFT]));
+	SDL_SetJoystickVirtualAxis(g_vr.pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, vr_trigger_axis(trigger[VR_RIGHT]));
+	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_SOUTH, g_vr.button_a);
+	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_EAST, g_vr.button_b);
+	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_WEST, g_vr.button_x);
+	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_NORTH, g_vr.button_y);
+	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 0);
+	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_LEFT_STICK, g_vr.stick_click[VR_RIGHT]);
+	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_RIGHT_STICK, g_vr.stick_click[VR_LEFT]);
 	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_START, g_vr.button_menu);
+	/* Unused since the radial menus replaced the left-grip shift layer. */
+	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 0);
+	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_MISC1, 0);
+	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_GUIDE, 0);
+	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_BACK, 0);
+	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_DPAD_UP, 0);
+	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_DPAD_DOWN, 0);
+	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_DPAD_LEFT, 0);
+	SDL_SetJoystickVirtualButton(g_vr.pad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, 0);
 	SDL_UnlockJoysticks();
 }
 
 /* Menus (concourse, briefing, options, and in a mission the settings
  * overlay) have no gamepad navigation, so there the buttons
- * type keys: A = Enter, B = Escape, Y = Space, menu = Escape,
- * left stick = arrows. While
+ * type keys (left controller): X = Enter, Y = Space, menu = Escape,
+ * left stick = arrows; the OpenXvT settings overlay gets the gamepad. While
  * flying nothing is typed; see vr_update_gamepad. */
 static void vr_update_menu_keys(int in_flight) {
-	const int   menu = !in_flight;
+	const int   menu = !in_flight && !XvtSettingsMenu_Open(); /* settings overlay: pad only */
 	const float lx   = g_vr.stick[VR_LEFT].x;
 	const float ly   = g_vr.stick[VR_LEFT].y;
 
-	vr_set_key(VR_KEY_A, SDL_SCANCODE_RETURN, menu && g_vr.button_a);
-	vr_set_key(VR_KEY_B, SDL_SCANCODE_ESCAPE, menu && g_vr.button_b);
-	vr_set_key(VR_KEY_X, SDL_SCANCODE_UNKNOWN, 0);
+	vr_set_key(VR_KEY_A, SDL_SCANCODE_UNKNOWN, 0);
+	vr_set_key(VR_KEY_B, SDL_SCANCODE_UNKNOWN, 0);
+	vr_set_key(VR_KEY_X, SDL_SCANCODE_RETURN, menu && g_vr.button_x);
 	vr_set_key(VR_KEY_Y, SDL_SCANCODE_SPACE, menu && g_vr.button_y);
 	vr_set_key(VR_KEY_RSTICK_CLICK, SDL_SCANCODE_UNKNOWN, 0);
 	vr_set_key(VR_KEY_LSTICK_CLICK, SDL_SCANCODE_UNKNOWN, 0);
 	vr_set_key(VR_KEY_LTRIGGER, SDL_SCANCODE_UNKNOWN, 0);
-	vr_set_key(VR_KEY_MENU, SDL_SCANCODE_ESCAPE, menu && g_vr.button_menu);
+	vr_set_key(VR_KEY_MENU, SDL_SCANCODE_ESCAPE, !in_flight && g_vr.button_menu);
 	vr_set_key(VR_KEY_UP, SDL_SCANCODE_UP, menu && ly > (g_vr.held_key[VR_KEY_UP] ? 0.4f : 0.7f));
 	vr_set_key(VR_KEY_DOWN, SDL_SCANCODE_DOWN, menu && ly < -(g_vr.held_key[VR_KEY_DOWN] ? 0.4f : 0.7f));
 	vr_set_key(VR_KEY_LEFT, SDL_SCANCODE_LEFT, menu && lx < -(g_vr.held_key[VR_KEY_LEFT] ? 0.4f : 0.7f));
@@ -1155,6 +1178,215 @@ static void vr_update_keyboard(int flying) {
 	if (g_vr.kb_drawn_flash && now_ms >= g_vr.kb.flash_until_ms) {
 		g_vr.kb_dirty = 1;
 	}
+}
+
+/* Panel pose for a radial menu: above the controller, turned to the head. */
+static int vr_radial_pose(VrHand hand, XrPosef* pose) {
+	XrSpaceLocation location = { XR_TYPE_SPACE_LOCATION };
+	XrVector3f      to_head;
+	float           len, yaw, pitch;
+
+	if (XR_FAILED(p_xrLocateSpace(g_vr.aim_space[hand], g_vr.local_space, g_vr.frame_state.predictedDisplayTime,
+								  &location)) ||
+		!(location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
+		return 0;
+	}
+	pose->position = location.pose.position;
+	pose->position.y += VR_RADIAL_LIFT_M;
+	to_head.x = g_vr.head_pos.x - pose->position.x;
+	to_head.y = g_vr.head_pos.y - pose->position.y;
+	to_head.z = g_vr.head_pos.z - pose->position.z;
+	len       = sqrtf(to_head.x * to_head.x + to_head.y * to_head.y + to_head.z * to_head.z);
+	if (len < 1e-3f) {
+		pose->orientation = (XrQuaternionf) { 0.0f, 0.0f, 0.0f, 1.0f };
+		return 1;
+	}
+	/* Quad normal (+z) towards the head: yaw about y, then pitch about x. */
+	yaw   = atan2f(to_head.x, to_head.z);
+	pitch = -asinf(to_head.y / len);
+	{
+		const float sy = sinf(yaw * 0.5f), cy = cosf(yaw * 0.5f);
+		const float sp = sinf(pitch * 0.5f), cp = cosf(pitch * 0.5f);
+		pose->orientation = (XrQuaternionf) { cy * sp, sy * cp, -sy * sp, cy * cp };
+	}
+	return 1;
+}
+
+static void vr_run_command(const VrCommand* command) {
+	XvtControllerMapping_DispatchCommand((XvtInputAction)command->action, true);
+	XvtControllerMapping_DispatchCommand((XvtInputAction)command->action, false);
+	Aeron_LogInfo(VR_LOG, "radial menu: %s", command->label);
+}
+
+/* Radial menus in flight. Left grip held: weapons/power, right grip held:
+ * targets/orders. The same hand's stick picks an entry; releasing the grip
+ * runs it (stick centred = cancel). */
+static void vr_update_radials(int flying) {
+	const uint64_t now_ms = SDL_GetTicks();
+
+	for (int hand = 0; hand < VR_HAND_COUNT; ++hand) {
+		VrRadialState*   radial = &g_vr.radial[hand];
+		const int        held   = flying && vr_hysteresis(g_vr.grip_down[hand], g_vr.grip[hand]);
+		const XrVector2f stick  = g_vr.stick[hand];
+		const float      mag    = sqrtf(stick.x * stick.x + stick.y * stick.y);
+		int              open   = held;
+
+		if (!radial->panel.swapchain) {
+			open = 0;
+		}
+
+		if (open && !radial->visible) {
+			radial->selected    = VR_RADIAL_NONE;
+			radial->suppressed  = 0;
+			radial->panel.dirty = 1;
+		}
+		if (open) {
+			const int item = !radial->suppressed &&
+									 mag > (radial->selected != VR_RADIAL_NONE ? VR_RADIAL_KEEP : VR_RADIAL_PICK)
+								 ? VrRadialMenu_ItemForDirection(stick.x, stick.y)
+								 : VR_RADIAL_NONE;
+			if (item != VR_RADIAL_NONE) {
+				if (item != radial->selected) {
+					radial->selected = item;
+					vr_kb_haptic((VrHand)hand);
+				}
+				radial->selected_ms = now_ms;
+			} else if (radial->selected != VR_RADIAL_NONE && now_ms - radial->selected_ms > VR_RADIAL_LINGER_MS) {
+				radial->selected = VR_RADIAL_NONE;
+			}
+			if (radial->selected != radial->drawn_selected) {
+				radial->panel.dirty = 1;
+			}
+			radial->pose_valid = vr_radial_pose((VrHand)hand, &radial->pose);
+		} else if (radial->visible && !held && radial->selected != VR_RADIAL_NONE) {
+			/* Grip released with an entry chosen: run it. */
+			vr_run_command(VrRadialMenu_Item((VrRadialSide)hand, radial->selected));
+			vr_kb_haptic((VrHand)hand);
+		}
+		radial->visible = open;
+	}
+}
+
+/* Uploads a CPU-drawn panel image into its swapchain. */
+static void vr_panel_upload(VrPanel* panel) {
+	XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+	XrSwapchainImageWaitInfo    wait_info    = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+	XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+	uint32_t                    index        = 0;
+	SDL_GPUCommandBuffer*       command_buffer;
+	void*                       mapped;
+
+	mapped = SDL_MapGPUTransferBuffer(g_vr.device, panel->transfer, true);
+	if (!mapped) {
+		return;
+	}
+	memcpy(mapped, panel->pixels, (size_t)panel->width * panel->height * 4);
+	SDL_UnmapGPUTransferBuffer(g_vr.device, panel->transfer);
+	if (!vr_ok(p_xrAcquireSwapchainImage(panel->swapchain, &acquire_info, &index), "xrAcquireSwapchainImage(panel)")) {
+		return;
+	}
+	wait_info.timeout = XR_INFINITE_DURATION;
+	if (!vr_ok(p_xrWaitSwapchainImage(panel->swapchain, &wait_info), "xrWaitSwapchainImage(panel)")) {
+		p_xrReleaseSwapchainImage(panel->swapchain, &release_info);
+		return;
+	}
+	command_buffer = SDL_AcquireGPUCommandBuffer(g_vr.device);
+	if (command_buffer) {
+		SDL_GPUTextureTransferInfo source;
+		SDL_GPUTextureRegion       region;
+		SDL_GPUCopyPass*           copy_pass;
+		SDL_zero(source);
+		SDL_zero(region);
+		source.transfer_buffer = panel->transfer;
+		source.pixels_per_row  = (Uint32)panel->width;
+		source.rows_per_layer  = (Uint32)panel->height;
+		region.texture         = panel->images[index];
+		region.w               = (Uint32)panel->width;
+		region.h               = (Uint32)panel->height;
+		region.d               = 1;
+		copy_pass              = SDL_BeginGPUCopyPass(command_buffer);
+		SDL_UploadToGPUTexture(copy_pass, &source, &region, false);
+		SDL_EndGPUCopyPass(copy_pass);
+		if (SDL_SubmitGPUCommandBuffer(command_buffer)) {
+			panel->dirty = 0;
+		} else {
+			Aeron_LogError(VR_LOG, "panel upload failed: %s", SDL_GetError());
+		}
+	}
+	p_xrReleaseSwapchainImage(panel->swapchain, &release_info);
+	panel->ever_released = 1;
+}
+
+static void vr_upload_radials(void) {
+	if (!g_vr.frame_begun) {
+		return;
+	}
+	for (int hand = 0; hand < VR_HAND_COUNT; ++hand) {
+		VrRadialState* radial = &g_vr.radial[hand];
+		if (!radial->visible || !radial->panel.dirty) {
+			continue;
+		}
+		VrRadialMenu_Render((VrRadialSide)hand, radial->selected, radial->panel.pixels, g_vr.panel_bgra);
+		radial->drawn_selected = radial->selected;
+		vr_panel_upload(&radial->panel);
+	}
+}
+
+static int vr_panel_create(VrPanel* panel, SDL_GPUTextureFormat format, const XrSwapchainCreateInfo* base, int width,
+						   int height) {
+	XrSwapchainCreateInfo           info     = *base;
+	SDL_GPUTransferBufferCreateInfo transfer = { 0 };
+
+	SDL_zero(*panel);
+	info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+					  XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+	info.width  = (uint32_t)width;
+	info.height = (uint32_t)height;
+	if (!vr_ok(SDL_CreateGPUXRSwapchain(g_vr.device, g_vr.session, &info, format, &panel->swapchain, &panel->images),
+			   "SDL_CreateGPUXRSwapchain(panel)")) {
+		SDL_zero(*panel);
+		return 0;
+	}
+	transfer.usage  = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+	transfer.size   = (Uint32)width * (Uint32)height * 4;
+	panel->transfer = SDL_CreateGPUTransferBuffer(g_vr.device, &transfer);
+	panel->pixels   = SDL_malloc(transfer.size);
+	panel->width    = width;
+	panel->height   = height;
+	if (!panel->transfer || !panel->pixels) {
+		Aeron_LogError(VR_LOG, "panel unavailable: %s", SDL_GetError());
+		SDL_DestroyGPUXRSwapchain(g_vr.device, panel->swapchain, panel->images);
+		if (panel->transfer) {
+			SDL_ReleaseGPUTransferBuffer(g_vr.device, panel->transfer);
+		}
+		SDL_free(panel->pixels);
+		SDL_zero(*panel);
+		return 0;
+	}
+	return 1;
+}
+
+static void vr_panel_destroy(SDL_GPUDevice* device, VrPanel* panel) {
+	if (panel->swapchain) {
+		SDL_DestroyGPUXRSwapchain(device, panel->swapchain, panel->images);
+	}
+	if (panel->transfer) {
+		SDL_ReleaseGPUTransferBuffer(device, panel->transfer);
+	}
+	SDL_free(panel->pixels);
+	SDL_zero(*panel);
+}
+
+static void vr_create_radials(SDL_GPUTextureFormat format, const XrSwapchainCreateInfo* base) {
+	g_vr.panel_bgra = format == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB || format == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+	for (int hand = 0; hand < VR_HAND_COUNT; ++hand) {
+		g_vr.radial[hand].selected       = VR_RADIAL_NONE;
+		g_vr.radial[hand].drawn_selected = VR_RADIAL_NONE;
+		if (!vr_panel_create(&g_vr.radial[hand].panel, format, base, VR_RADIAL_SIZE_PX, VR_RADIAL_SIZE_PX)) {
+			Aeron_LogError(VR_LOG, "radial menu %d unavailable", hand);
+		}
+	}
+	Aeron_LogInfo(VR_LOG, "radial menus ready (%dx%d)", VR_RADIAL_SIZE_PX, VR_RADIAL_SIZE_PX);
 }
 
 /* Redraws the keyboard image into its swapchain when it changed. */
@@ -1473,6 +1705,7 @@ static void vr_update_input(void) {
 
 	vr_create_pad();
 	vr_update_keyboard(flying);
+	vr_update_radials(flying);
 	vr_update_pointer();
 	vr_autotest_apply_pointer();
 	vr_update_mouse_buttons(flying);
@@ -1560,6 +1793,9 @@ static void vr_prepare_stereo(void) {
 		out->target_width   = g_vr.eye_width;
 		out->target_height  = g_vr.eye_height;
 	}
+	g_vr.head_pos.x       = (g_vr.views[0].pose.position.x + g_vr.views[1].pose.position.x) * 0.5f;
+	g_vr.head_pos.y       = (g_vr.views[0].pose.position.y + g_vr.views[1].pose.position.y) * 0.5f;
+	g_vr.head_pos.z       = (g_vr.views[0].pose.position.z + g_vr.views[1].pose.position.z) * 0.5f;
 	g_vr.views_valid      = 1;
 	g_vr.stereo_published = 1;
 	XvtRemasterVr_SetStereoFrame(&frame);
@@ -1591,6 +1827,7 @@ static int vr_begin_frame(void* userdata) {
 	g_vr.frame_begun = 1;
 	vr_update_input();
 	vr_upload_keyboard();
+	vr_upload_radials();
 	vr_prepare_stereo();
 	return 1;
 }
@@ -1624,14 +1861,13 @@ static int vr_acquire(SDL_GPUCommandBuffer* command_buffer, SDL_GPUTexture** tex
 
 static void vr_end_xr_frame(void) {
 	XrFrameEndInfo                     end_info = { XR_TYPE_FRAME_END_INFO };
-	XrCompositionLayerPassthroughFB    passthrough = { XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB };
 	XrCompositionLayerQuad             quad        = { XR_TYPE_COMPOSITION_LAYER_QUAD };
 	XrCompositionLayerQuad             kb_quad     = { XR_TYPE_COMPOSITION_LAYER_QUAD };
 	XrCompositionLayerProjection       projection  = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
 	XrCompositionLayerProjectionView   proj_views[2];
-	const XrCompositionLayerBaseHeader* layers[4];
+	XrCompositionLayerQuad             radial_quad[VR_HAND_COUNT];
+	const XrCompositionLayerBaseHeader* layers[3 + VR_HAND_COUNT];
 	uint32_t                           layer_count = 0;
-	const int                          in_flight   = vr_in_flight();
 	const int stereo = g_vr.stereo_published && g_vr.views_valid && XvtRemasterVr_StereoRendered();
 	float     hud_tan[4];
 
@@ -1667,12 +1903,6 @@ static void vr_end_xr_frame(void) {
 			projection.viewCount  = 2;
 			projection.views      = proj_views;
 			layers[layer_count++] = (const XrCompositionLayerBaseHeader*)&projection;
-		}
-		if (g_vr.has_passthrough && !in_flight) {
-			passthrough.flags       = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-			passthrough.space       = XR_NULL_HANDLE;
-			passthrough.layerHandle = g_vr.passthrough_layer;
-			layers[layer_count++]   = (const XrCompositionLayerBaseHeader*)&passthrough;
 		}
 		if (g_vr.image_ever_released) {
 			quad.layerFlags                       = 0;
@@ -1715,6 +1945,26 @@ static void vr_end_xr_frame(void) {
 			kb_quad.size.height                      = vr_kb_height_m();
 			layers[layer_count++]                    = (const XrCompositionLayerBaseHeader*)&kb_quad;
 		}
+		for (int hand = 0; hand < VR_HAND_COUNT; ++hand) {
+			const VrRadialState* radial = &g_vr.radial[hand];
+			XrCompositionLayerQuad* rq  = &radial_quad[hand];
+			if (!radial->visible || !radial->pose_valid || !radial->panel.ever_released) {
+				continue;
+			}
+			SDL_zero(*rq);
+			/* Premultiplied alpha, drawn over everything. */
+			rq->type                           = XR_TYPE_COMPOSITION_LAYER_QUAD;
+			rq->layerFlags                     = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+			rq->space                          = g_vr.local_space;
+			rq->eyeVisibility                  = XR_EYE_VISIBILITY_BOTH;
+			rq->subImage.swapchain             = radial->panel.swapchain;
+			rq->subImage.imageRect.extent.width  = radial->panel.width;
+			rq->subImage.imageRect.extent.height = radial->panel.height;
+			rq->pose                           = radial->pose;
+			rq->size.width                     = VR_RADIAL_SIZE_M;
+			rq->size.height                    = VR_RADIAL_SIZE_M;
+			layers[layer_count++]              = (const XrCompositionLayerBaseHeader*)rq;
+		}
 	}
 	end_info.displayTime          = g_vr.frame_state.predictedDisplayTime;
 	end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -1735,14 +1985,11 @@ static void vr_shutdown(SDL_GPUDevice* device, void* userdata) {
 	if (g_vr.frame_begun || g_vr.image_acquired) {
 		vr_end_xr_frame();
 	}
-	if (g_vr.passthrough_layer && p_xrDestroyPassthroughLayerFB) {
-		p_xrDestroyPassthroughLayerFB(g_vr.passthrough_layer);
-	}
-	if (g_vr.passthrough && p_xrDestroyPassthroughFB) {
-		p_xrDestroyPassthroughFB(g_vr.passthrough);
-	}
 	vr_release_eye_images();
 	vr_destroy_keyboard(device);
+	for (int hand = 0; hand < VR_HAND_COUNT; ++hand) {
+		vr_panel_destroy(device, &g_vr.radial[hand].panel);
+	}
 	for (int eye = 0; eye < 2; ++eye) {
 		if (g_vr.eye_swapchain[eye]) {
 			SDL_DestroyGPUXRSwapchain(device, g_vr.eye_swapchain[eye], g_vr.eye_images[eye]);

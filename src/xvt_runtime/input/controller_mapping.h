@@ -12,6 +12,9 @@ int XvtControllerMapping_Axis(XvtInputAxis axis);
 uint16_t XvtControllerMapping_Modifiers(void);
 uint16_t XvtControllerMapping_ReadKey(void);
 void XvtControllerMapping_ReleaseCommands(void);
+/* Runs `action` as if a pad button bound to it changed state (Quest VR radial
+ * menus). Same thread as XvtControllerMapping_Update. */
+void XvtControllerMapping_DispatchCommand(XvtInputAction action, bool pressed);
 const AeronControllerSnapshot* XvtControllerMapping_Resolve(const XvtControllerModel* model,
 															const AeronInputSnapshot* input,
 															uint32_t preferred);

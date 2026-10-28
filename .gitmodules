@@ -1,4 +1,3 @@
 [submodule "aeron"]
 	path = aeron
-	url = https://github.com/SgtBilko76/Aeron.git
-	branch = quest-vr-xvt
+	url = https://github.com/elyosh/Aeron.git

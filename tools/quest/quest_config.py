@@ -11,12 +11,11 @@ the X-Wing Alliance VR port):
   right stick y    -> lefty (throttle lever, stays where it is left)
   triggers         -> lefttrigger / righttrigger
   A / B / X / Y    -> south / east / west / north
-  right grip       -> rightshoulder
-  right / left stick click -> guide / rightstick
+  right / left stick click -> leftstick / rightstick
   Menu             -> start
-  left grip held (shift layer): A/B/X/Y -> dpaddown/dpadright/dpadleft/dpadup,
-                   left trigger -> leftshoulder, right grip -> misc1,
-                   right stick click -> leftstick, left stick click -> back
+The grips are not on the pad: holding one opens that hand's radial menu,
+whose entries run input actions directly (src/xvt_vr/vr_radial_menu.c).
+Same button layout as OpenTIE VR and OpenXW VR.
 
 Usage: quest_config.py <staged resources/config.yaml>
 Only the VR APK is affected; desktop builds keep the upstream defaults.
@@ -36,22 +35,13 @@ QUEST_GAMEPAD_DEFAULTS = """\
         - {axis: righttrigger, direction: positive, threshold: 0.5}
       target_roll_modifier:
         - {axis: lefttrigger, direction: positive, threshold: 0.5}
-      auto_target: rightshoulder
       target_next: south
-      cycle_weapon_group: east
+      target_nearest_fighter_or_mine: east
       target_my_attacker: west
-      target_nearest_fighter_or_mine: north
-      cycle_weapon_firing_mode: rightstick
-      hyperspace_or_map_help: guide
+      match_speed: north
+      hyperspace_or_map_help: leftstick
+      view_forward: rightstick
       escape: start
-      cycle_cannon_recharge_rate: dpaddown
-      cycle_shield_recharge_rate: dpadright
-      cycle_shield_mode: dpadleft
-      xfer_cannon_to_shields: dpadup
-      toggle_beam: leftshoulder
-      target_component_next: misc1
-      match_speed: leftstick
-      target_objective: back
 """
 
 

@@ -1,6 +1,6 @@
 #include "xvt_vr/vr_keyboard.h"
 
-#include "xvt_vr/vr_keyboard_font.h"
+#include "xvt_vr/vr_draw.h"
 
 #include <string.h>
 
@@ -114,108 +114,25 @@ const char* VrKeyboard_Press(VrKeyboard* kb, int key, uint64_t now_ms) {
 	}
 }
 
-/* ------------------------------------------------------------------------ */
-/* Rasterizer (premultiplied RGBA8)                                         */
-
-typedef struct Rgba {
-	uint8_t r, g, b, a;
-} Rgba;
-
-static void blend_px(uint8_t* p, Rgba c, int coverage) {
-	/* c is straight alpha; coverage 0..255 */
-	const int a   = c.a * coverage / 255;
-	const int inv = 255 - a;
-	p[0]          = (uint8_t)((c.r * a + p[0] * inv) / 255);
-	p[1]          = (uint8_t)((c.g * a + p[1] * inv) / 255);
-	p[2]          = (uint8_t)((c.b * a + p[2] * inv) / 255);
-	p[3]          = (uint8_t)(a + p[3] * inv / 255);
-}
-
-static void fill_round_rect(uint8_t* img, int x0, int y0, int x1, int y1, int r, Rgba c) {
-	for (int y = y0; y < y1; ++y) {
-		if (y < 0 || y >= VR_KB_HEIGHT_PX) {
-			continue;
-		}
-		for (int x = x0; x < x1; ++x) {
-			int dx = 0, dy = 0;
-			if (x < 0 || x >= VR_KB_WIDTH_PX) {
-				continue;
-			}
-			if (x < x0 + r) {
-				dx = x0 + r - x;
-			} else if (x >= x1 - r) {
-				dx = x - (x1 - r - 1);
-			}
-			if (y < y0 + r) {
-				dy = y0 + r - y;
-			} else if (y >= y1 - r) {
-				dy = y - (y1 - r - 1);
-			}
-			if (dx * dx + dy * dy > r * r) {
-				continue;
-			}
-			blend_px(img + ((size_t)y * VR_KB_WIDTH_PX + x) * 4, c, 255);
-		}
-	}
-}
-
-static int text_width(const char* text) {
-	int width = 0;
-	for (; *text; ++text) {
-		const unsigned char ch = (unsigned char)*text;
-		if (ch >= VR_FONT_FIRST && ch <= VR_FONT_LAST) {
-			width += vr_font_glyphs[ch - VR_FONT_FIRST].advance;
-		}
-	}
-	return width;
-}
-
-static void draw_text_centered(uint8_t* img, const char* text, int cx, int cy, Rgba c) {
-	int pen_x    = cx - text_width(text) / 2;
-	int baseline = cy + VR_FONT_ASCENT / 2 - 2;
-
-	for (; *text; ++text) {
-		const unsigned char ch = (unsigned char)*text;
-		const VrGlyph*      g;
-		if (ch < VR_FONT_FIRST || ch > VR_FONT_LAST) {
-			continue;
-		}
-		g = &vr_font_glyphs[ch - VR_FONT_FIRST];
-		for (int gy = 0; gy < g->h; ++gy) {
-			const int y = baseline + g->yoff + gy;
-			if (y < 0 || y >= VR_KB_HEIGHT_PX) {
-				continue;
-			}
-			for (int gx = 0; gx < g->w; ++gx) {
-				const int x        = pen_x + g->xoff + gx;
-				const int coverage = vr_font_bits[g->offset + gy * g->w + gx];
-				if (coverage && x >= 0 && x < VR_KB_WIDTH_PX) {
-					blend_px(img + ((size_t)y * VR_KB_WIDTH_PX + x) * 4, c, coverage);
-				}
-			}
-		}
-		pen_x += g->advance;
-	}
-}
-
 void VrKeyboard_Render(const VrKeyboard* kb, uint8_t* rgba, int bgra, uint64_t now_ms) {
-	static const Rgba panel     = { 12, 16, 24, 225 };
-	static const Rgba key_char  = { 52, 58, 70, 245 };
-	static const Rgba key_spec  = { 34, 40, 52, 245 };
-	static const Rgba key_hover = { 70, 120, 200, 255 };
-	static const Rgba key_shift = { 200, 140, 40, 255 };
-	static const Rgba key_flash = { 230, 230, 240, 255 };
-	static const Rgba label     = { 240, 240, 245, 255 };
-	static const Rgba label_dk  = { 20, 20, 25, 255 };
+	static const VrRgba panel     = { 12, 16, 24, 225 };
+	static const VrRgba key_char  = { 52, 58, 70, 245 };
+	static const VrRgba key_spec  = { 34, 40, 52, 245 };
+	static const VrRgba key_hover = { 70, 120, 200, 255 };
+	static const VrRgba key_shift = { 200, 140, 40, 255 };
+	static const VrRgba key_flash = { 230, 230, 240, 255 };
+	static const VrRgba label     = { 240, 240, 245, 255 };
+	static const VrRgba label_dk  = { 20, 20, 25, 255 };
+	VrImage             img       = { rgba, VR_KB_WIDTH_PX, VR_KB_HEIGHT_PX };
 
-	memset(rgba, 0, (size_t)VR_KB_WIDTH_PX * VR_KB_HEIGHT_PX * 4);
-	fill_round_rect(rgba, 0, 0, VR_KB_WIDTH_PX, VR_KB_HEIGHT_PX, 24, panel);
+	VrDraw_Clear(&img);
+	VrDraw_RoundRect(&img, 0, 0, VR_KB_WIDTH_PX, VR_KB_HEIGHT_PX, 24, panel);
 
 	for (int key = 0; key < KEY_COUNT; ++key) {
 		const VrKeyDef* def     = &k_keys[key];
 		const int       flashed = key == kb->flash_key && now_ms < kb->flash_until_ms;
 		const int       hovered = key == kb->hover[0] || key == kb->hover[1];
-		Rgba            fill    = def->kind == VR_KEY_KIND_CHAR ? key_char : key_spec;
+		VrRgba          fill    = def->kind == VR_KEY_KIND_CHAR ? key_char : key_spec;
 		int             x0, y0, x1, y1;
 
 		if (def->kind == VR_KEY_KIND_SHIFT && kb->shift) {
@@ -228,17 +145,12 @@ void VrKeyboard_Render(const VrKeyboard* kb, uint8_t* rgba, int bgra, uint64_t n
 			fill = key_flash;
 		}
 		key_rect(key, &x0, &y0, &x1, &y1);
-		fill_round_rect(rgba, x0, y0, x1, y1, KEY_RADIUS, fill);
-		draw_text_centered(rgba, kb->shift ? def->upper : def->lower, (x0 + x1) / 2, (y0 + y1) / 2,
-						   flashed ? label_dk : label);
+		VrDraw_RoundRect(&img, x0, y0, x1, y1, KEY_RADIUS, fill);
+		VrDraw_TextCentered(&img, kb->shift ? def->upper : def->lower, (x0 + x1) / 2, (y0 + y1) / 2,
+							flashed ? label_dk : label);
 	}
 
 	if (bgra) {
-		const size_t count = (size_t)VR_KB_WIDTH_PX * VR_KB_HEIGHT_PX;
-		for (size_t i = 0; i < count; ++i) {
-			const uint8_t r = rgba[i * 4];
-			rgba[i * 4]     = rgba[i * 4 + 2];
-			rgba[i * 4 + 2] = r;
-		}
+		VrDraw_SwapRedBlue(&img);
 	}
 }

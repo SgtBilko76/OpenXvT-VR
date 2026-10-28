@@ -310,6 +310,8 @@ set(XVT_APP_SOURCES
     src/xvt_app/settings/controller_page.c
     src/xvt_vr/xvt_vr.c
     src/xvt_vr/vr_keyboard.c
+    src/xvt_vr/vr_draw.c
+    src/xvt_vr/vr_radial_menu.c
 )
 if(ANDROID)
     # Quest/PICO: SDLActivity loads the game as libmain.so and calls SDL_main().
