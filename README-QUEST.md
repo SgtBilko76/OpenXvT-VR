@@ -25,6 +25,8 @@ data.
 
 ## Controls
 
+![OpenXvT VR controller mapping](docs/controls.webp)
+
 Hold the Meta button on the right controller to re-centre the view.
 
 Menus (concourse, briefing, options, the in-flight settings screen):
