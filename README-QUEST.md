@@ -1,5 +1,7 @@
 # OpenXvT VR for Meta Quest
 
+**Download, install guide, controls and pictures: [portroyale.online/openxvt.html](https://portroyale.online/openxvt.html)**
+
 Standalone Meta Quest 3 port of OpenXvT (Star Wars: X-Wing vs. TIE Fighter
 and Balance of Power) with OpenXR: menus on a virtual screen over
 passthrough, head-tracked stereo 3D space in flight, 3D cockpits from
