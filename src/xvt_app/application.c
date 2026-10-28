@@ -49,6 +49,29 @@ static void XvtApplication_DropStaleVrPads(XvtControllerOptions* options, const 
 		options->models[kept++] = options->models[i];
 	}
 	options->count = kept;
+	/* The new pad, saved while the old one still held the axes, has none:
+	 * give it the default axes. */
+	for (size_t i = 0; i < options->count; ++i) {
+		XvtControllerModel* m = &options->models[i];
+		if (strcmp(m->guid, current))
+			continue;
+		bool any_axis = false;
+		for (int axis = 0; axis < XVT_INPUT_AXIS_COUNT; ++axis)
+			any_axis |= m->profile.mapping.axes[axis].source >= 0;
+		if (!any_axis) {
+			m->profile.mapping = XvtConfig_DefaultSettings()->gamepad_defaults.mapping;
+			Aeron_LogInfo("xvt.input", "Quest Touch pad had no stick axes: default axes restored");
+		}
+		static bool logged;
+		if (!logged) {
+			logged = true;
+			Aeron_LogInfo("xvt.input", "Quest Touch pad axes: yaw %d, pitch %d, roll %d, throttle %d",
+						  m->profile.mapping.axes[XVT_INPUT_AXIS_YAW].source,
+						  m->profile.mapping.axes[XVT_INPUT_AXIS_PITCH].source,
+						  m->profile.mapping.axes[XVT_INPUT_AXIS_ROLL].source,
+						  m->profile.mapping.axes[XVT_INPUT_AXIS_THROTTLE].source);
+		}
+	}
 }
 #endif
 
