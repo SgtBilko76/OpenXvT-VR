@@ -15,6 +15,7 @@
 #include "xvt_runtime/storage/storage.h"
 #include "xvt_vr/xvt_vr.h"
 #include <stdio.h>
+#include <string.h>
 
 static uint64_t XvtApplication_PresentationIntervalUs(void) {
 	double rate = Aeron_PresentationRate();
@@ -24,6 +25,33 @@ static uint64_t XvtApplication_PresentationIntervalUs(void) {
 	return (uint64_t)(1000000.0 / rate + 0.5);
 }
 
+#ifdef __ANDROID__
+/* Quest VR: the virtual Touch pad got a new product id in 0.1.1 (new default
+ * layout). A saved model of the old pad would keep every axis (a newly added
+ * model only gets axes no other model uses), so saved Touch pads that are not
+ * the connected one are dropped. */
+static void XvtApplication_DropStaleVrPads(XvtControllerOptions* options, const AeronInputSnapshot* input) {
+	static const char vr_pad[] = "Quest Touch Controllers";
+	const char* current = NULL;
+	for (int slot = 0; input && slot < AERON_CONTROLLER_MAX; ++slot) {
+		const AeronControllerSnapshot* d = &input->controllers[slot];
+		if (d->connected && !strcmp(d->name, vr_pad))
+			current = d->guid;
+	}
+	if (!current)
+		return;
+	size_t kept = 0;
+	for (size_t i = 0; i < options->count; ++i) {
+		if (!strcmp(options->models[i].name, vr_pad) && strcmp(options->models[i].guid, current)) {
+			Aeron_LogInfo("xvt.input", "dropping the old Quest Touch pad model %s", options->models[i].guid);
+			continue;
+		}
+		options->models[kept++] = options->models[i];
+	}
+	options->count = kept;
+}
+#endif
+
 static void XvtApplication_DiscoverControllers(const AeronInputSnapshot* input) {
 	static char previous_error[512];
 	const XvtSettings* settings = XvtConfig_Settings();
@@ -31,6 +59,9 @@ static void XvtApplication_DiscoverControllers(const AeronInputSnapshot* input) 
 		return;
 	XvtControllerOptions candidate = settings->controller;
 	char error[512] = { 0 };
+#ifdef __ANDROID__
+	XvtApplication_DropStaleVrPads(&candidate, input);
+#endif
 	bool ok = XvtControllerOptions_InitializeGamepads(
 		&candidate, &XvtConfig_DefaultSettings()->gamepad_defaults, input, error, sizeof error);
 	if (!XvtControllerOptions_Equals(&candidate, &settings->controller)) {
